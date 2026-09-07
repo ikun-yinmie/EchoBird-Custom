@@ -11,10 +11,18 @@ export interface NewModelForm {
   anthropicUrl: string;
   apiKey: string;
   modelId: string;
-  // Quick-pick model id options, carried over from a right-panel directory
-  // entry click. ≥2 options → the Add-Model modal shows a dropdown above the
-  // model id input. Absent/empty → no dropdown (manual add / edit). Purely a
-  // convenience picker; the model id input is always free-editable.
+  // Which protocol the single merged address field is being edited as.
+  // Absent → inferred on open (anthropic-only ⇒ 'anthropic', else 'openai').
+  addressFormat?: 'openai' | 'anthropic' | 'gemini';
+  // OpenAI address flavor: /chat/completions-style chat vs the /responses
+  // (应答) endpoint. Only meaningful while addressFormat === 'openai'.
+  openaiSub?: 'chat' | 'responses';
+  // Quick-pick model id options: carried over from a right-panel directory
+  // entry click, or filled by the modal's 获取模型 fetch against the typed
+  // OpenAI base URL. ≥2 options → the Add-Model modal shows a searchable
+  // dropdown above the model id input. Absent/empty → no dropdown (manual
+  // add / edit). Purely a convenience picker; the model id input is always
+  // free-editable.
   modelIdOptions?: string[];
 }
 
@@ -79,9 +87,13 @@ export interface ModelNexusCtx {
   closeModelModal: () => void;
   // Actions
   pingAllModels: () => Promise<void>;
+  /** Single-model latency test (per-card [测速]). */
+  pingSingleModel: (modelId: string) => Promise<void>;
   refreshAllUsage: () => Promise<void>;
   refreshSingleUsage: (modelId: string) => Promise<void>; // Single model refresh
   handleTestModel: () => Promise<void>;
+  /** Copy connection info (endpoint + model id + key) for a model. */
+  copyModelConnection: (internalId: string) => Promise<void>;
 }
 
 // ===== Context =====

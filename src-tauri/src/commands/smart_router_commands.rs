@@ -1,5 +1,5 @@
 use crate::models::model::ModelConfig;
-use crate::services::smart_router::{self, PublicActivity, PublicConfig};
+use crate::services::smart_router::{self, PublicActivity, PublicConfig, TokenStat};
 
 #[tauri::command]
 pub fn get_smart_router_config() -> Result<PublicConfig, String> {
@@ -24,4 +24,15 @@ pub fn get_smart_router_candidates() -> Vec<ModelConfig> {
 #[tauri::command]
 pub fn remove_smart_router_candidate(internal_id: String) -> Result<PublicConfig, String> {
     smart_router::remove_candidate(&internal_id)
+}
+
+#[tauri::command]
+pub fn get_smart_router_token_stats() -> Vec<TokenStat> {
+    smart_router::token_stats()
+}
+
+#[tauri::command]
+pub fn reset_smart_router_token_stats(internal_id: Option<String>) -> bool {
+    smart_router::reset_token_stats(internal_id);
+    true
 }

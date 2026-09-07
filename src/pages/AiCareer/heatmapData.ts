@@ -9,6 +9,13 @@ import type { HeatmapEntry } from '../../api/aiCareer';
 export const WEEKS = 30;
 export const DAYS = 7;
 
+// Approximate cumulative tokens *processed*. Each turn re-sends the ever-
+// growing context, so real usage runs far above the raw stored content (stored
+// once, re-read many times) — the on-disk byte size is scaled up to reflect
+// that. Deliberately generous; stats are labelled "约 / Est." anyway. Shared
+// by the cumulative stat and the per-hour day chart.
+export const TOKENS_PER_BYTE = 12;
+
 export type HeatLevel = 0 | 1 | 2 | 3 | 4;
 
 export interface DayCell {

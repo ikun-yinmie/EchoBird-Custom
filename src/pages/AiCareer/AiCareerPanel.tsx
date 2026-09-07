@@ -11,10 +11,11 @@
 // than a synchronous state reset.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Check, Copy } from 'lucide-react';
+import { Check, Copy, MessageSquareText } from 'lucide-react';
 import { useI18n } from '../../hooks/useI18n';
 import { useAiCareerStore } from '../../stores/aiCareerStore';
 import { aiCareerFamilyHistory, type SavedSession } from '../../api/aiCareer';
+import { TranscriptViewerDialog, type TranscriptTarget } from './TranscriptViewerDialog';
 
 const PAGE = 30;
 // Title-bar widths for skeleton rows — varied so the placeholder reads as a
@@ -49,6 +50,7 @@ function SkeletonRow({ w }: { w: string }) {
 export function AiCareerPanel() {
   const { t, locale } = useI18n();
   const selectedFamily = useAiCareerStore((s) => s.selectedFamily);
+  const familyNames = useAiCareerStore((s) => s.familyNames);
   const refreshKey = useAiCareerStore((s) => s.refreshKey);
 
   const [rows, setRows] = useState<Row[]>([]);
@@ -56,6 +58,7 @@ export function AiCareerPanel() {
   const [loadingMore, setLoadingMore] = useState(false);
   const [hasMore, setHasMore] = useState(true);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [openTarget, setOpenTarget] = useState<TranscriptTarget | null>(null);
   const offsetRef = useRef(0);
   const sentinelRef = useRef<HTMLDivElement>(null);
 
@@ -189,7 +192,26 @@ export function AiCareerPanel() {
         return (
           <div
             key={session.id}
-            className="group flex items-center gap-2 rounded-lg border border-cyber-border/40 bg-cyber-text/[0.02] px-3 py-2.5 hover:bg-cyber-text/[0.06] transition-colors"
+            role="button"
+            tabIndex={0}
+            title={t('aiCareer.openChat')}
+            onClick={() =>
+              setOpenTarget({
+                family: session.tool,
+                familyName: familyNames[session.tool],
+                session,
+              })
+            }
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.target as HTMLElement).tagName !== 'BUTTON') {
+                setOpenTarget({
+                  family: session.tool,
+                  familyName: familyNames[session.tool],
+                  session,
+                });
+              }
+            }}
+            className="group flex items-center gap-2 rounded-lg border border-cyber-border/40 bg-cyber-text/[0.02] px-3 py-2.5 hover:bg-cyber-text/[0.06] hover:border-cyber-border/80 cursor-pointer transition-colors outline-none"
           >
             <div className="flex-1 min-w-0">
               <div className="text-[13px] text-cyber-text truncate">{session.name}</div>
@@ -209,6 +231,10 @@ export function AiCareerPanel() {
                 )}
               </button>
             )}
+            <MessageSquareText
+              size={13}
+              className="flex-shrink-0 text-cyber-text-muted opacity-0 group-hover:opacity-100 transition-all"
+            />
           </div>
         );
       })}
@@ -218,6 +244,11 @@ export function AiCareerPanel() {
       {/* Loading more → a few skeleton rows at the tail. */}
       {loadingMore &&
         SKELETON_WIDTHS.slice(0, 3).map((w, i) => <SkeletonRow key={`more-${i}`} w={w} />)}
+
+      {/* Chat transcript popup when a session row is clicked. */}
+      {openTarget && (
+        <TranscriptViewerDialog target={openTarget} onClose={() => setOpenTarget(null)} />
+      )}
     </div>
   );
 }

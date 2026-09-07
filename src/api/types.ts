@@ -31,6 +31,15 @@ export interface LocalTool extends DetectedTool {
   displayName?: string;
 }
 
+// User-added desktop entry (the "+" tile): launch-only, no model config.
+// Persisted in localStorage; `path` is the executable picked via the native
+// file dialog.
+export interface CustomDesktopApp {
+  id: string;
+  name: string;
+  path: string;
+}
+
 // ─── Model Types ───
 
 export interface ModelConfig {

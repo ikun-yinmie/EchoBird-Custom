@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   DndContext,
   PointerSensor,
@@ -23,13 +23,22 @@ import {
   Box as BoxIcon,
   Eye,
   EyeOff,
+  MousePointerClick,
+  Plus,
   RefreshCw,
+  RotateCcw,
   Settings,
+  Trash2,
+  X,
 } from 'lucide-react';
 import { getModelIcon, EffortPulse } from '../../components';
+import { useConfirm } from '../../components/ConfirmDialog';
+import { open as openDialog } from '@tauri-apps/plugin-dialog';
+import { IS_WINDOWS } from '../../utils/platform';
+import { DesktopContextMenu } from './DesktopContextMenu';
 import { useI18n } from '../../hooks/useI18n';
 import * as api from '../../api/tauri';
-import type { ModelConfig, LocalTool } from '../../api/types';
+import type { CustomDesktopApp, ModelConfig, LocalTool } from '../../api/types';
 import type { TKey } from '../../i18n';
 import { useAppManager } from './context';
 import { useNavigationStore } from '../../stores/navigationStore';
@@ -143,6 +152,66 @@ const catLabelKey = (cat: string): TKey => {
   return map[cat] || (cat as TKey);
 };
 
+// Parent directory of a detected path, for "打开文件位置". Null when the
+// detected path is a bare command ("opencode") or module ref ("python -m x")
+// with no directory component — the menu item is disabled then.
+export const desktopParentDir = (p: string): string | null => {
+  const idx = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return idx > 0 ? p.slice(0, idx) : null;
+};
+
+const HIDDEN_TOOLS_KEY = 'echobird_appmgr_hidden_tools';
+
+// Icons hidden via the right-click "删除图标" item. Same localStorage pattern
+// as the drag order above; the app itself stays installed.
+export const loadHiddenTools = (): string[] => {
+  try {
+    const v = localStorage.getItem(HIDDEN_TOOLS_KEY);
+    const arr: unknown = v ? JSON.parse(v) : [];
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveHiddenTools = (ids: string[]): void => {
+  try {
+    localStorage.setItem(HIDDEN_TOOLS_KEY, JSON.stringify(ids));
+  } catch {
+    /* private mode */
+  }
+};
+
+const DELETED_TOOLS_KEY = 'echobird_appmgr_deleted_tools';
+
+// Tool ids hard-deleted via "删除": gone from the desktop AND the
+// hidden row, surviving rescans. Restored manually from the "+" dialog.
+export const loadDeletedTools = (): string[] => {
+  try {
+    const v = localStorage.getItem(DELETED_TOOLS_KEY);
+    const arr: unknown = v ? JSON.parse(v) : [];
+    return Array.isArray(arr) ? arr.filter((x): x is string => typeof x === 'string') : [];
+  } catch {
+    return [];
+  }
+};
+
+export const saveDeletedTools = (ids: string[]): void => {
+  try {
+    localStorage.setItem(DELETED_TOOLS_KEY, JSON.stringify(ids));
+  } catch {
+    /* private mode */
+  }
+};
+
+// Default entry name from a picked executable path: file stem without the
+// extension ("code.exe" → "code", "/usr/bin/foo" → "foo").
+export const customNameFromPath = (p: string): string => {
+  const base = p.split(/[\\/]/).pop() ?? '';
+  const stem = base.replace(/\.[^.]+$/, '');
+  return stem || base;
+};
+
 // Localized display name — resolves per-locale `names` like ToolCard, but
 // prefers `displayName` when present (the pre-localized label some tools
 // carry), then falls back to the plain name.
@@ -163,6 +232,8 @@ interface DesktopIconProps {
   tool: LocalTool;
   selected: boolean;
   onClick: () => void;
+  /** Right-click menu (installed desktop icons). */
+  onContextMenu?: (e: React.MouseEvent) => void;
   /** dnd-kit drag attributes/listeners (sortable tiles only). Applied to the
       button itself so the tile stays a single focusable control instead of
       nesting a button inside a role="button" wrapper. */
@@ -172,7 +243,13 @@ interface DesktopIconProps {
 // A desktop-style launcher tile: icon on top, name beneath. Clicking selects;
 // the bottom bar holds the launch / install action. All icons render
 // uniformly — which section an app sits in (已安装 / 未安装) tells the state.
-const DesktopIcon: React.FC<DesktopIconProps> = ({ tool, selected, onClick, dragProps }) => {
+const DesktopIcon: React.FC<DesktopIconProps> = ({
+  tool,
+  selected,
+  onClick,
+  onContextMenu,
+  dragProps,
+}) => {
   const { locale } = useI18n();
   const [iconSrc, setIconSrc] = useState<string>(`./icons/tools/${tool.id}.svg`);
   const displayName = toolDisplayName(tool, locale);
@@ -189,6 +266,7 @@ const DesktopIcon: React.FC<DesktopIconProps> = ({ tool, selected, onClick, drag
     <button
       {...dragProps}
       onClick={onClick}
+      onContextMenu={onContextMenu}
       aria-label={displayName}
       className="flex flex-col items-center gap-1.5 px-1.5 py-3 w-full rounded-xl outline-none transition-colors select-none cursor-pointer focus-visible:ring-2 focus-visible:ring-cyber-accent"
     >
@@ -223,7 +301,12 @@ const DesktopIcon: React.FC<DesktopIconProps> = ({ tool, selected, onClick, drag
 // Sortable wrapper for installed icons — drag to rearrange the desktop.
 // The wrapper is the grid item; the tile inside fills it (w-full) so the
 // drag handles and the click-to-select behavior stay aligned.
-const SortableDesktopIcon: React.FC<DesktopIconProps> = ({ tool, selected, onClick }) => {
+const SortableDesktopIcon: React.FC<DesktopIconProps> = ({
+  tool,
+  selected,
+  onClick,
+  onContextMenu,
+}) => {
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
     id: tool.id,
   });
@@ -242,14 +325,334 @@ const SortableDesktopIcon: React.FC<DesktopIconProps> = ({ tool, selected, onCli
         tool={tool}
         selected={selected}
         onClick={onClick}
+        onContextMenu={onContextMenu}
         dragProps={{ ...attributes, ...listeners }}
       />
     </div>
   );
 };
 
+// Hidden row shows at most this many restore chips inline; the overflow
+// lives behind the count badge that opens the restore dialog.
+export const MAX_INLINE_HIDDEN = 3;
+
+interface HiddenToolsDialogProps {
+  tools: LocalTool[];
+  onRestore: (id: string) => void;
+  /** Hard delete (× badge): gone everywhere, restorable via the "+" dialog. */
+  onPermanentDelete: (id: string) => void;
+  /** Right-click an icon: restore / delete menu (same delete confirm). */
+  onContextMenu: (tool: LocalTool, e: React.MouseEvent) => void;
+  /** Batch restore from the header button: every hidden app returns. */
+  onRestoreAll: () => void;
+  /** Batch hard delete from the header button (confirm handled by caller). */
+  onDeleteAll: () => void;
+  onClose: () => void;
+  t: (key: TKey) => string;
+}
+
+// Restore dialog for hidden desktop icons: 7 icons per row, fixed to one
+// third of the window height, vertical scroll for the overflow. Left-click
+// restores to the desktop; right-click offers restore / delete; the × badge
+// hard-deletes; the header offers 全部恢复 / 全部删除 batch actions.
+// Right-clicks on empty dialog area are swallowed.
+export const HiddenToolsDialog: React.FC<HiddenToolsDialogProps> = ({
+  tools,
+  onRestore,
+  onPermanentDelete,
+  onRestoreAll,
+  onDeleteAll,
+  onContextMenu,
+  onClose,
+  t,
+}) => {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div className="fixed inset-0 z-[9500] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div
+        role="dialog"
+        aria-label={`${t('desktopMenu.hidden')} (${tools.length})`}
+        onContextMenu={(e) => e.preventDefault()}
+        className="relative w-[640px] max-w-[92vw] h-[33vh] flex flex-col rounded-xl border border-cyber-border bg-cyber-surface shadow-2xl overflow-hidden"
+      >
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-cyber-border/60 flex-shrink-0">
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="text-sm font-bold text-cyber-text flex-shrink-0">
+              {t('desktopMenu.hidden')} ({tools.length})
+            </span>
+            {tools.length > 0 && (
+              <>
+                <button
+                  onClick={onRestoreAll}
+                  aria-label={t('desktopMenu.restoreAll')}
+                  className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-bold border border-amber-500/70 text-amber-500 hover:bg-amber-500/10 transition-colors outline-none"
+                >
+                  <RotateCcw size={12} />
+                  {t('desktopMenu.restoreAll')}
+                </button>
+                <button
+                  onClick={onDeleteAll}
+                  aria-label={t('desktopMenu.deleteAll')}
+                  className="flex items-center gap-1 px-2 py-1 rounded-md text-xs font-bold border border-red-500/80 text-red-400 hover:bg-red-500/15 transition-colors outline-none"
+                >
+                  <Trash2 size={12} />
+                  {t('desktopMenu.deleteAll')}
+                </button>
+              </>
+            )}
+          </div>
+          <button
+            onClick={onClose}
+            aria-label={t('btn.cancel')}
+            className="flex items-center justify-center w-7 h-7 rounded-md text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10 transition-colors outline-none"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        {tools.length > 0 && (
+          <div className="flex-shrink-0 flex items-center gap-2 px-3.5 py-2 border-b border-cyber-accent/25 bg-cyber-accent/10">
+            <MousePointerClick size={15} className="flex-shrink-0 text-cyber-accent" />
+            <span className="text-xs font-bold text-cyber-accent">
+              {t('desktopMenu.clickToRestore')}
+            </span>
+          </div>
+        )}
+        <div className="flex-1 overflow-y-auto pulse-scroll p-3">
+          <div className="grid grid-cols-7 gap-2 content-start">
+            {tools.map((tool) => (
+              <div key={tool.id} className="relative" onContextMenu={(e) => onContextMenu(tool, e)}>
+                <DesktopIcon
+                  tool={tool}
+                  selected={false}
+                  onClick={() => onRestore(tool.id)}
+                  onContextMenu={(e) => e.preventDefault()}
+                />
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPermanentDelete(tool.id);
+                  }}
+                  aria-label={t('desktopMenu.permanentDelete')}
+                  title={t('desktopMenu.permanentDelete')}
+                  className="absolute top-1 right-1 flex items-center justify-center w-5 h-5 rounded-full bg-red-500/90 text-white hover:bg-red-500 transition-colors outline-none"
+                >
+                  <X size={12} />
+                </button>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Custom "+" entries render as plain desktop tiles: launch-only, no model
+// config, icon falls back to the box glyph (no bundled svg exists for them).
+const customAsTool = (c: CustomDesktopApp): LocalTool => ({
+  id: c.id,
+  name: c.name,
+  displayName: c.name,
+  category: 'Custom',
+  installed: true,
+  detectedPath: c.path,
+  noModelConfig: true,
+});
+
+// Trailing "+" tile: left-click opens the add dialog. Intentionally NOT
+// sortable and NOT right-clickable — it's an action, not an app.
+const AddDesktopTile: React.FC<{ onClick: () => void; label: string }> = ({ onClick, label }) => (
+  <button
+    onClick={onClick}
+    aria-label={label}
+    className="flex flex-col items-center gap-1.5 px-1.5 py-3 w-full rounded-xl outline-none transition-colors select-none cursor-pointer focus-visible:ring-2 focus-visible:ring-cyber-accent"
+  >
+    <span className="flex items-center justify-center w-14 h-14 rounded-2xl border-2 border-dashed border-cyber-border text-cyber-text-secondary hover:border-cyber-accent hover:text-cyber-accent transition-colors">
+      <Plus size={28} />
+    </span>
+    <span className="text-xs leading-snug text-center w-full line-clamp-2 break-words text-cyber-text-secondary">
+      {label}
+    </span>
+  </button>
+);
+
+interface AddAppDialogProps {
+  customs: CustomDesktopApp[];
+  /** Hard-deleted scanned tools that can be restored. */
+  deleted: LocalTool[];
+  onAdd: (name: string, path: string) => void;
+  onRemoveCustom: (id: string) => void;
+  onRestoreDeleted: (id: string) => void;
+  onClose: () => void;
+  t: (key: TKey) => string;
+}
+
+// The "+" dialog: pick an executable via the OS-native file picker (with an
+// address bar; Windows is filtered to executables), manage manually added
+// entries, and restore hard-deleted scanned tools.
+export const AddAppDialog: React.FC<AddAppDialogProps> = ({
+  customs,
+  deleted,
+  onAdd,
+  onRemoveCustom,
+  onRestoreDeleted,
+  onClose,
+  t,
+}) => {
+  const [customName, setCustomName] = useState('');
+  const [customPath, setCustomPath] = useState('');
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  const handleBrowse = async () => {
+    try {
+      const picked = await openDialog({
+        multiple: false,
+        directory: false,
+        filters: IS_WINDOWS
+          ? [{ name: 'Programs', extensions: ['exe', 'lnk', 'bat', 'cmd'] }]
+          : undefined,
+      });
+      if (typeof picked === 'string' && picked) {
+        setCustomPath(picked);
+        setCustomName((prev) => prev || customNameFromPath(picked));
+      }
+    } catch {
+      /* cancelled */
+    }
+  };
+
+  const canAdd = customName.trim() !== '' && customPath.trim() !== '';
+  const inputClass =
+    'w-full px-3 py-2 text-sm rounded-md border border-cyber-border/50 bg-cyber-surface text-cyber-text outline-none focus:border-cyber-accent placeholder:text-cyber-text-muted';
+
+  return (
+    <div className="fixed inset-0 z-[9500] flex items-center justify-center">
+      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" onClick={onClose} />
+      <div
+        role="dialog"
+        aria-label={t('addApp.title')}
+        className="relative w-[560px] max-w-[92vw] max-h-[70vh] flex flex-col rounded-xl border border-cyber-border bg-cyber-surface shadow-2xl overflow-hidden"
+      >
+        <div className="flex items-center justify-between px-4 py-2.5 border-b border-cyber-border/60 flex-shrink-0">
+          <span className="text-sm font-bold text-cyber-text">{t('addApp.title')}</span>
+          <button
+            onClick={onClose}
+            aria-label={t('btn.cancel')}
+            className="flex items-center justify-center w-7 h-7 rounded-md text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10 transition-colors outline-none"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="flex-1 overflow-y-auto pulse-scroll p-4 space-y-5">
+          <section className="space-y-2.5">
+            <h4 className="text-xs font-bold text-cyber-text-secondary tracking-wider">
+              {t('addApp.customSection')}
+            </h4>
+            <label className="block space-y-1.5">
+              <span className="text-xs text-cyber-text-secondary">{t('addApp.nameLabel')}</span>
+              <input
+                value={customName}
+                onChange={(e) => setCustomName(e.target.value)}
+                placeholder={t('addApp.namePlaceholder')}
+                className={inputClass}
+              />
+            </label>
+            <label className="block space-y-1.5">
+              <span className="text-xs text-cyber-text-secondary">{t('addApp.pathLabel')}</span>
+              <span className="flex gap-2">
+                <input value={customPath} readOnly placeholder="…" className={inputClass} />
+                <button
+                  onClick={() => void handleBrowse()}
+                  className="flex-shrink-0 px-3 py-2 text-sm rounded-md border border-cyber-border/50 text-cyber-text hover:bg-cyber-text/10 transition-colors outline-none"
+                >
+                  {t('addApp.browse')}
+                </button>
+              </span>
+            </label>
+            <button
+              disabled={!canAdd}
+              onClick={() => {
+                onAdd(customName.trim(), customPath.trim());
+                setCustomName('');
+                setCustomPath('');
+              }}
+              className="w-full py-2 rounded-lg bg-cyber-accent text-white text-sm font-bold hover:bg-cyber-accent-secondary disabled:opacity-40 disabled:cursor-not-allowed transition-colors outline-none"
+            >
+              {t('addApp.add')}
+            </button>
+          </section>
+          {customs.length > 0 && (
+            <section className="space-y-2">
+              <h4 className="text-xs font-bold text-cyber-text-secondary tracking-wider">
+                {t('addApp.mySection')}
+              </h4>
+              {customs.map((c) => (
+                <div
+                  key={c.id}
+                  className="flex items-center gap-3 px-3 py-2 rounded-lg bg-cyber-text/5"
+                >
+                  <div className="flex-1 min-w-0">
+                    <div className="text-sm font-bold truncate">{c.name}</div>
+                    <div className="text-[11px] text-cyber-text-secondary truncate opacity-70">
+                      {c.path}
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => onRemoveCustom(c.id)}
+                    className="flex-shrink-0 text-xs text-red-400 hover:text-red-300 transition-colors outline-none"
+                  >
+                    {t('addApp.remove')}
+                  </button>
+                </div>
+              ))}
+            </section>
+          )}
+          {deleted.length > 0 && (
+            <section className="space-y-2">
+              <h4 className="text-xs font-bold text-cyber-text-secondary tracking-wider">
+                {t('addApp.deletedSection')}
+              </h4>
+              {deleted.map((tool) => (
+                <div
+                  key={tool.id}
+                  className="flex items-center gap-3 px-3 py-2 rounded-lg bg-cyber-text/5"
+                >
+                  <div className="flex-1 min-w-0 text-sm font-bold truncate">
+                    {tool.displayName || tool.name}
+                  </div>
+                  <button
+                    onClick={() => onRestoreDeleted(tool.id)}
+                    className="flex-shrink-0 text-xs text-cyber-accent hover:opacity-80 transition-opacity outline-none"
+                  >
+                    {t('addApp.restore')}
+                  </button>
+                </div>
+              ))}
+            </section>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 export const AppManagerMain: React.FC = () => {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const {
     detectedTools,
     isScanning,
@@ -257,7 +660,13 @@ export const AppManagerMain: React.FC = () => {
     setSelectedTool,
     aiInstallableIds,
     showUninstalled,
+    handleLaunch,
+    setApplyError,
+    customTools,
+    addCustomTool,
+    removeCustomTool,
   } = useAppManager();
+  const confirm = useConfirm();
   // Active category tab for the "未安装" section. 'ALL' shows every
   // uninstalled app; the other tabs filter by category.
   const [activeUninstalledCat, setActiveUninstalledCat] = useState('ALL');
@@ -281,6 +690,50 @@ export const AppManagerMain: React.FC = () => {
     }
   };
 
+  // Icons hidden via the right-click "删除图标" item. Same persisted pattern
+  // as the drag order; hidden tools render in the slim restore row below.
+  const [hiddenTools, setHiddenTools] = useState<string[]>(loadHiddenTools);
+  const hideTool = (id: string) => {
+    setHiddenTools((prev) => {
+      if (prev.includes(id)) return prev;
+      const next = [...prev, id];
+      saveHiddenTools(next);
+      return next;
+    });
+  };
+  const restoreTool = (id: string) => {
+    setHiddenTools((prev) => {
+      const next = prev.filter((x) => x !== id);
+      saveHiddenTools(next);
+      return next;
+    });
+  };
+
+  // Hard-deleted tool ids ("删除"): hidden from the desktop and the
+  // hidden row across rescans; restored manually from the "+" dialog.
+  const [deletedTools, setDeletedTools] = useState<string[]>(loadDeletedTools);
+  const deleteToolForever = (id: string) => {
+    setHiddenTools((prev) => {
+      if (!prev.includes(id)) return prev;
+      const next = prev.filter((x) => x !== id);
+      saveHiddenTools(next);
+      return next;
+    });
+    setDeletedTools((prev) => {
+      if (prev.includes(id)) return prev;
+      const next = [...prev, id];
+      saveDeletedTools(next);
+      return next;
+    });
+  };
+  const restoreDeletedTool = (id: string) => {
+    setDeletedTools((prev) => {
+      const next = prev.filter((x) => x !== id);
+      saveDeletedTools(next);
+      return next;
+    });
+  };
+
   const installed = useMemo(
     () => detectedTools.filter((tool) => tool.installed).sort(compareTools),
     [detectedTools]
@@ -291,14 +744,36 @@ export const AppManagerMain: React.FC = () => {
   );
 
   // Apply the saved order on top of the default sort: known ids first in
-  // saved order, then any freshly-detected tools in default order.
+  // saved order, then any freshly-detected tools in default order. Hidden
+  // and hard-deleted icons are excluded — they render in the restore row /
+  // "+" dialog instead. User-added "+" entries join the same pool so they
+  // drag and persist like scanned tools.
+  const customTiles = useMemo(() => customTools.map(customAsTool), [customTools]);
   const installedOrdered = useMemo(() => {
+    const pool = [
+      ...installed.filter((t) => !hiddenTools.includes(t.id) && !deletedTools.includes(t.id)),
+      ...customTiles,
+    ];
     const orderIndex = new Map(toolOrder.map((id, i) => [id, i]));
-    const known = installed.filter((t) => orderIndex.has(t.id));
-    const unknown = installed.filter((t) => !orderIndex.has(t.id));
+    const known = pool.filter((t) => orderIndex.has(t.id));
+    const unknown = pool.filter((t) => !orderIndex.has(t.id));
     known.sort((a, b) => orderIndex.get(a.id)! - orderIndex.get(b.id)!);
     return [...known, ...unknown];
-  }, [installed, toolOrder]);
+  }, [installed, toolOrder, hiddenTools, deletedTools, customTiles]);
+
+  const hiddenInstalled = useMemo(
+    () =>
+      [...installed, ...customTiles]
+        .filter((t) => hiddenTools.includes(t.id) && !deletedTools.includes(t.id))
+        .sort(compareTools),
+    [installed, customTiles, hiddenTools, deletedTools]
+  );
+
+  // Hard-deleted scanned tools that still exist (for the "+" restore list).
+  const deletedInstalled = useMemo(
+    () => installed.filter((t) => deletedTools.includes(t.id)).sort(compareTools),
+    [installed, deletedTools]
+  );
 
   // Drag-reorder for installed icons — pointer with a 5px activation so
   // plain clicks still select; keyboard for a11y. On drop, reorder in place
@@ -326,6 +801,134 @@ export const AppManagerMain: React.FC = () => {
   const handleDragCancel = () => setActiveDragId(null);
 
   const activeDragTool = activeDragId ? installed.find((t) => t.id === activeDragId) : undefined;
+
+  // Right-click menu state.
+  const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
+  const [menuMode, setMenuMode] = useState<'desktop' | 'hidden'>('desktop');
+  const [hiddenOpen, setHiddenOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
+
+  const closeMenu = useCallback(() => {
+    setMenu(null);
+  }, []);
+
+  const openMenu = useCallback(
+    (tool: LocalTool, e: React.MouseEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      // Right-click also selects — the bottom bar then acts on the same app.
+      setSelectedTool(tool.id);
+      setMenuMode('desktop');
+      setMenu({ id: tool.id, x: e.clientX, y: e.clientY });
+    },
+    [setSelectedTool]
+  );
+
+  // Right-click menu inside the hidden dialog: restore + delete only.
+  const openHiddenMenu = useCallback((tool: LocalTool, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setMenuMode('hidden');
+    setMenu({ id: tool.id, x: e.clientX, y: e.clientY });
+  }, []);
+
+  const menuTool = menu
+    ? (detectedTools.find((t) => t.id === menu.id) ?? customTiles.find((t) => t.id === menu.id))
+    : undefined;
+
+  const handleMenuLaunch = () => {
+    if (!menu) return;
+    const id = menu.id;
+    closeMenu();
+    setSelectedTool(id);
+    void handleLaunch(id);
+  };
+
+  const handleMenuReveal = () => {
+    const dir = menuTool?.detectedPath ? desktopParentDir(menuTool.detectedPath) : null;
+    closeMenu();
+    if (!dir) return;
+    api
+      .openFolder(dir)
+      .catch((err) => setApplyError(err instanceof Error ? err.message : String(err)));
+  };
+
+  // Shared hard-delete flow for the desktop menu item and the hidden-dialog
+  // × badge. Custom "+" entries drop their whole record; scanned tools move
+  // to the hard-deleted list (restorable from the "+" dialog). Resolves true
+  // when something was actually deleted.
+  const confirmPermanentDelete = async (id: string): Promise<boolean> => {
+    const target = detectedTools.find((t) => t.id === id) ?? customTiles.find((t) => t.id === id);
+    const name = target ? toolDisplayName(target, locale) : id;
+    const custom = customTools.find((c) => c.id === id);
+    closeMenu();
+    if (custom) {
+      const ok = await confirm({
+        title: t('desktopMenu.permanentDelete'),
+        message: t('addApp.removeCustomConfirm').replace('{name}', name),
+        confirmText: t('desktopMenu.permanentDelete'),
+        type: 'danger',
+      });
+      if (ok) removeCustomTool(id);
+      return ok;
+    }
+    const ok = await confirm({
+      title: t('desktopMenu.permanentDelete'),
+      message: t('desktopMenu.permanentDeleteConfirm').replace('{name}', name),
+      confirmText: t('desktopMenu.permanentDelete'),
+      type: 'danger',
+    });
+    if (ok) deleteToolForever(id);
+    return ok;
+  };
+
+  // After a dialog-initiated delete, close the dialog when it just emptied.
+  // No-op for desktop-menu deletes (hiddenOpen is false there).
+  const finishDialogAfterDelete = (done: boolean) => {
+    if (done && hiddenOpen && hiddenInstalled.length <= 1) setHiddenOpen(false);
+  };
+
+  const handleMenuPermanentDelete = () => {
+    if (!menu) return;
+    void confirmPermanentDelete(menu.id).then(finishDialogAfterDelete);
+  };
+
+  // Hidden-mode restore from the dialog's right-click menu.
+  const handleHiddenRestore = () => {
+    if (!menu) return;
+    restoreTool(menu.id);
+    closeMenu();
+    if (hiddenInstalled.length <= 1) setHiddenOpen(false);
+  };
+
+  // Header batch actions of the hidden dialog: 全部恢复 puts every hidden
+  // app back on the desktop at once; 全部删除 hard-deletes them all after a
+  // single shared confirm — custom entries drop their record, scanned tools
+  // move to the "+" dialog's restore list.
+  const handleRestoreAllHidden = () => {
+    closeMenu();
+    for (const tool of hiddenInstalled) restoreTool(tool.id);
+    setHiddenOpen(false);
+  };
+
+  const handleDeleteAllHidden = async () => {
+    const targets = hiddenInstalled;
+    closeMenu();
+    if (targets.length === 0) return;
+    const ok = await confirm({
+      title: t('desktopMenu.permanentDelete'),
+      message: t('desktopMenu.deleteAllConfirm').replace('{count}', String(targets.length)),
+      confirmText: t('desktopMenu.permanentDelete'),
+      type: 'danger',
+    });
+    if (!ok) return;
+    for (const tool of targets) {
+      const custom = customTools.find((c) => c.id === tool.id);
+      if (custom) removeCustomTool(tool.id);
+      else deleteToolForever(tool.id);
+    }
+    setHiddenOpen(false);
+  };
 
   // Category tabs present among the uninstalled apps: the canonical order
   // first, then any unknown categories alphabetically.
@@ -381,39 +984,70 @@ export const AppManagerMain: React.FC = () => {
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto pulse-scroll pr-1 scrollbar-stable">
-          {/* Installed — flat draggable grid, no section header (per spec) */}
-          {installedOrdered.length > 0 && (
-            <div className={showUninstalled && uninstalled.length > 0 ? 'mb-8' : ''}>
-              <DndContext
-                sensors={sensors}
-                collisionDetection={closestCenter}
-                onDragStart={handleDragStart}
-                onDragEnd={handleDragEnd}
-                onDragCancel={handleDragCancel}
+          {/* Installed — flat draggable grid, no section header (per spec).
+              The trailing "+" tile is always present (even with zero apps):
+              left-click only, no drag, no right-click menu. */}
+          <div className={showUninstalled && uninstalled.length > 0 ? 'mb-8' : ''}>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+              onDragCancel={handleDragCancel}
+            >
+              <SortableContext
+                items={installedOrdered.map((t) => t.id)}
+                strategy={rectSortingStrategy}
               >
-                <SortableContext
-                  items={installedOrdered.map((t) => t.id)}
-                  strategy={rectSortingStrategy}
-                >
-                  <div className={gridClass}>
-                    {installedOrdered.map((tool) => (
-                      <SortableDesktopIcon
-                        key={tool.id}
-                        tool={tool}
-                        selected={selectedTool === tool.id}
-                        onClick={() => setSelectedTool(tool.id)}
-                      />
-                    ))}
+                <div className={gridClass}>
+                  {installedOrdered.map((tool) => (
+                    <SortableDesktopIcon
+                      key={tool.id}
+                      tool={tool}
+                      selected={selectedTool === tool.id}
+                      onClick={() => setSelectedTool(tool.id)}
+                      onContextMenu={(e) => openMenu(tool, e)}
+                    />
+                  ))}
+                  <AddDesktopTile onClick={() => setAddOpen(true)} label={t('addApp.add')} />
+                </div>
+              </SortableContext>
+              <DragOverlay>
+                {activeDragTool && (
+                  <div className="pointer-events-none opacity-70 scale-105 drop-shadow-lg">
+                    <DesktopIcon tool={activeDragTool} selected={false} onClick={() => {}} />
                   </div>
-                </SortableContext>
-                <DragOverlay>
-                  {activeDragTool && (
-                    <div className="pointer-events-none opacity-70 scale-105 drop-shadow-lg">
-                      <DesktopIcon tool={activeDragTool} selected={false} onClick={() => {}} />
-                    </div>
-                  )}
-                </DragOverlay>
-              </DndContext>
+                )}
+              </DragOverlay>
+            </DndContext>
+          </div>
+
+          {/* Hidden via right-click "删除图标" — up to 3 inline restore
+              chips; the count badge opens the full restore dialog. */}
+          {hiddenInstalled.length > 0 && (
+            <div className="mb-8 flex items-center gap-2 flex-wrap px-1">
+              <span className="text-xs text-cyber-text-muted flex-shrink-0">
+                {t('desktopMenu.hidden')}
+              </span>
+              {hiddenInstalled.slice(0, MAX_INLINE_HIDDEN).map((tool) => (
+                <button
+                  key={tool.id}
+                  onClick={() => restoreTool(tool.id)}
+                  title={t('desktopMenu.restoreHint')}
+                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-full border border-cyber-border/50 text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10 transition-colors outline-none"
+                >
+                  <RotateCcw size={12} />
+                  <span className="max-w-[10rem] truncate">{toolDisplayName(tool, locale)}</span>
+                </button>
+              ))}
+              {hiddenInstalled.length > MAX_INLINE_HIDDEN && (
+                <button
+                  onClick={() => setHiddenOpen(true)}
+                  className="flex items-center justify-center min-w-7 h-7 px-2 rounded-full bg-cyber-accent/15 text-cyber-accent text-xs font-bold hover:bg-cyber-accent/25 transition-colors outline-none"
+                >
+                  {hiddenInstalled.length}
+                </button>
+              )}
             </div>
           )}
 
@@ -458,6 +1092,53 @@ export const AppManagerMain: React.FC = () => {
             </section>
           )}
         </div>
+      )}
+      {menu && menuTool && (
+        <DesktopContextMenu
+          t={t}
+          x={menu.x}
+          y={menu.y}
+          canReveal={!!menuTool.detectedPath && desktopParentDir(menuTool.detectedPath) !== null}
+          onLaunch={handleMenuLaunch}
+          onReveal={handleMenuReveal}
+          onHide={() => {
+            hideTool(menu.id);
+            closeMenu();
+          }}
+          onPermanentDelete={handleMenuPermanentDelete}
+          onRestore={handleHiddenRestore}
+          mode={menuMode}
+          onClose={closeMenu}
+        />
+      )}
+      {hiddenOpen && (
+        <HiddenToolsDialog
+          tools={hiddenInstalled}
+          onRestore={(id) => {
+            restoreTool(id);
+            // Last one restored — nothing left to show, close the dialog.
+            if (hiddenInstalled.length <= 1) setHiddenOpen(false);
+          }}
+          onRestoreAll={handleRestoreAllHidden}
+          onDeleteAll={() => void handleDeleteAllHidden()}
+          onPermanentDelete={(id) => {
+            void confirmPermanentDelete(id).then(finishDialogAfterDelete);
+          }}
+          onContextMenu={(tool, e) => openHiddenMenu(tool, e)}
+          onClose={() => setHiddenOpen(false)}
+          t={t}
+        />
+      )}
+      {addOpen && (
+        <AddAppDialog
+          customs={customTools}
+          deleted={deletedInstalled}
+          onAdd={(name, path) => addCustomTool({ id: `custom-${Date.now()}`, name, path })}
+          onRemoveCustom={(id) => void confirmPermanentDelete(id)}
+          onRestoreDeleted={restoreDeletedTool}
+          onClose={() => setAddOpen(false)}
+          t={t}
+        />
       )}
     </div>
   );
@@ -524,6 +1205,31 @@ export const ModelListSection: React.FC<ModelListSectionProps> = ({
   const toolProtocols = useMemo(
     () => selectedToolData.apiProtocol || ['openai', 'anthropic'],
     [selectedToolData.apiProtocol]
+  );
+
+  // Approximate aggregate token usage flowing through the Auto Router proxy,
+  // surfaced on its card. Polled lightly while this section is mounted.
+  const [routerTokenStats, setRouterTokenStats] = useState<api.SmartRouterTokenStat[]>([]);
+  useEffect(() => {
+    let alive = true;
+    const load = async () => {
+      try {
+        const stats = await api.getSmartRouterTokenStats();
+        if (alive) setRouterTokenStats(stats);
+      } catch {
+        /* router not running / not reachable — keep last known */
+      }
+    };
+    void load();
+    const timer = window.setInterval(() => void load(), 8000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+  const totalRoutedTokens = routerTokenStats.reduce(
+    (sum, stat) => sum + stat.inputTokens + stat.outputTokens,
+    0
   );
 
   const { smartRouterModels, localModels, cloudModels } = useMemo(() => {
@@ -668,6 +1374,9 @@ export const ModelListSection: React.FC<ModelListSectionProps> = ({
           </div>
           <div className="text-[10px] text-cyber-text-secondary truncate leading-tight mt-1 opacity-70">
             {apiPath}
+            {model.internalId === 'smart-router' && totalRoutedTokens > 0
+              ? ` · ${totalRoutedTokens.toLocaleString()} tok`
+              : ''}
           </div>
         </div>
       </div>

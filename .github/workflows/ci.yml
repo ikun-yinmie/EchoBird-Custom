@@ -102,3 +102,38 @@ jobs:
           # Remove an --ignore when its dependency chain gains a fixed release.
           cargo audit --file src-tauri/Cargo.lock --ignore RUSTSEC-2026-0194 --ignore RUSTSEC-2026-0195 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2026-0235
         continue-on-error: true
+
+  rust-windows:
+    # Rust code is otherwise only compiled on Windows during release builds.
+    # Compile-check here on every PR so cfg(windows) regressions fail fast
+    # instead of surfacing at release time.
+    if: github.actor != 'dependabot[bot]'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Same toolchain pin as the rust job above (and release.yml).
+      - uses: dtolnay/rust-toolchain@1.93
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo build
+        uses: actions/cache@v5
+        with:
+          path: src-tauri/target
+          key: ${{ runner.os }}-cargo-build-target-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check (Windows)
+        run: cargo check --manifest-path src-tauri/Cargo.toml --all-targets

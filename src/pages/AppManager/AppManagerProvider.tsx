@@ -3,7 +3,7 @@ import { useConfirm } from '../../components/ConfirmDialog';
 import { EFFORT_PULSE_ONESHOT_MS } from '../../components';
 import { useI18n } from '../../hooks/useI18n';
 import * as api from '../../api/tauri';
-import type { ModelConfig } from '../../api/types';
+import type { CustomDesktopApp, ModelConfig } from '../../api/types';
 import { AppManagerContext } from './context';
 import { useToolsStore } from '../../stores/toolsStore';
 import { useNavigationStore } from '../../stores/navigationStore';
@@ -97,6 +97,40 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
 
   // Internalized state
   const [selectedTool, setSelectedTool] = useState<string | null>(null);
+
+  // User-added desktop entries (the "+" tile): validated on load, persisted
+  // on every change. Launch-only — the model-config flow never sees them.
+  const CUSTOM_TOOLS_KEY = 'echobird_appmgr_custom_tools';
+  const loadCustomTools = (): CustomDesktopApp[] => {
+    try {
+      const v = localStorage.getItem(CUSTOM_TOOLS_KEY);
+      const arr: unknown = v ? JSON.parse(v) : [];
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(
+        (x): x is CustomDesktopApp =>
+          !!x &&
+          typeof x === 'object' &&
+          typeof (x as CustomDesktopApp).id === 'string' &&
+          typeof (x as CustomDesktopApp).name === 'string' &&
+          typeof (x as CustomDesktopApp).path === 'string'
+      );
+    } catch {
+      return [];
+    }
+  };
+  const [customTools, setCustomTools] = useState<CustomDesktopApp[]>(loadCustomTools);
+  const persistCustomTools = (next: CustomDesktopApp[]) => {
+    setCustomTools(next);
+    try {
+      localStorage.setItem(CUSTOM_TOOLS_KEY, JSON.stringify(next));
+    } catch {
+      /* private mode */
+    }
+  };
+  const addCustomTool = (tool: CustomDesktopApp) =>
+    persistCustomTools([...customTools.filter((c) => c.id !== tool.id), tool]);
+  const removeCustomTool = (id: string) =>
+    persistCustomTools(customTools.filter((c) => c.id !== id));
   const [isLaunching, setIsLaunching] = useState(false);
   const [applyError, setApplyError] = useState<string | null>(null);
 
@@ -500,24 +534,41 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
     }
   };
 
-  // Launch handler
-  const handleLaunch = async () => {
-    if (!selectedTool || isLaunching) return;
+  // Launch handler — `toolId` defaults to the selected tool so the bottom
+  // bar keeps working unchanged; the desktop right-click menu passes its
+  // own id (setSelectedTool is async, so the menu can't rely on it).
+  const handleLaunch = async (toolId?: string) => {
+    const target = toolId ?? selectedTool;
+    if (!target || isLaunching) return;
     setIsLaunching(true);
     setTimeout(() => setIsLaunching(false), 3000); // 3 second cooldown
 
-    const toolData = detectedTools.find((t) => t.id === selectedTool);
+    // User-added entry (the "+" tile): spawn its executable directly, no
+    // model config, no folder prompt.
+    const custom = customTools.find((c) => c.id === target);
+    if (custom) {
+      try {
+        await api.launchCustomApp(custom.path);
+      } catch (err) {
+        console.error('Failed to launch custom app:', err);
+        setApplyError(err instanceof Error ? err.message : String(err));
+      }
+      setIsLaunching(false);
+      return;
+    }
+
+    const toolData = detectedTools.find((t) => t.id === target);
     const isLaunchable = !!toolData?.launchFile;
     const noModelConfig = !!toolData?.noModelConfig;
 
     // Write model config to file only when the "apply via official config" checkbox is on.
     // Launchable tools (e.g. games) always pass config via URL hash, never via file write.
     // no-model-config tools (e.g. desktop apps) skip config writes entirely.
-    if (!noModelConfig && agreedConfigPolicy && !isLaunchable && toolModelConfig[selectedTool]) {
-      const pending = toolModelConfig[selectedTool]!;
+    if (!noModelConfig && agreedConfigPolicy && !isLaunchable && toolModelConfig[target]) {
+      const pending = toolModelConfig[target]!;
       const applyResult = isOfficialModelSentinel(pending)
-        ? await applyRestore(selectedTool)
-        : await applyModelConfig(selectedTool, pending);
+        ? await applyRestore(target)
+        : await applyModelConfig(target, pending);
       if (applyResult !== true) {
         setApplyError(typeof applyResult === 'string' ? applyResult : t('key.destroyed'));
         setIsLaunching(false);
@@ -532,7 +583,7 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
     if (launchAfterApply || noModelConfig) {
       if (isLaunchable) {
         // Launchable tool (e.g. game): open independent window with model config
-        const selectedModelId = toolModelConfig[selectedTool];
+        const selectedModelId = toolModelConfig[target];
         const selectedModel = selectedModelId
           ? userModels.find((m) => m.internalId === selectedModelId)
           : undefined;
@@ -547,7 +598,7 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
               locale,
             }
           : { locale };
-        const result = await api.launchGame(selectedTool, toolData!.launchFile!, modelConfig);
+        const result = await api.launchGame(target, toolData!.launchFile!, modelConfig);
         if (result && !result.success) {
           console.error('Failed to launch:', result.message);
           if (result.message) setApplyError(result.message);
@@ -559,7 +610,7 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
           // show "模型: -" even after a successful launch.
           setDetectedTools((prev) =>
             prev.map((t) =>
-              t.id === selectedTool
+              t.id === target
                 ? { ...t, activeModel: selectedModel.modelId || selectedModel.internalId }
                 : t
             )
@@ -596,7 +647,7 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
           }
         }
         try {
-          await api.startTool(selectedTool, toolData?.startCommand, cwd);
+          await api.startTool(target, toolData?.startCommand, cwd);
         } catch (err) {
           console.error('Failed to launch tool:', err);
           setApplyError(err instanceof Error ? err.message : String(err));
@@ -642,6 +693,9 @@ export const AppManagerProvider: React.FC<AppManagerProviderProps> = ({ children
         handleLaunch,
         onGoToMother: handleGoToMother,
         aiInstallableIds,
+        customTools,
+        addCustomTool,
+        removeCustomTool,
         showUninstalled,
         setShowUninstalled,
       }}

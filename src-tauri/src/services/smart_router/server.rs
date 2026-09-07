@@ -11,7 +11,7 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use futures_util::{stream, StreamExt};
+use futures_util::{stream, Stream, StreamExt};
 use http_body_util::BodyExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -192,6 +192,165 @@ struct CandidateHealth {
     fingerprint: String,
     #[serde(default)]
     failure: Option<FailureClass>,
+    // Approximate cumulative token usage routed through this candidate.
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenStat {
+    pub internal_id: String,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
+/// Per-candidate token usage since the last reset (rough: only counts usage
+/// blocks the router happens to see — streams without an explicit usage chunk
+/// are under-counted rather than guessed).
+pub fn token_stats() -> Vec<TokenStat> {
+    let memory = shared_route_memory();
+    let Ok(memory) = memory.lock() else {
+        return Vec::new();
+    };
+    let mut stats: Vec<TokenStat> = memory
+        .candidates
+        .iter()
+        .filter(|(_, health)| health.input_tokens > 0 || health.output_tokens > 0)
+        .map(|(id, health)| TokenStat {
+            internal_id: id.clone(),
+            input_tokens: health.input_tokens,
+            output_tokens: health.output_tokens,
+        })
+        .collect();
+    stats.sort_by(|a, b| a.internal_id.cmp(&b.internal_id));
+    stats
+}
+
+/// Zero the token counters — all candidates (None) or a single one.
+pub fn reset_token_stats(internal_id: Option<&str>) {
+    let memory = shared_route_memory();
+    let Ok(mut memory) = memory.lock() else {
+        return;
+    };
+    let mut changed = false;
+    for (id, health) in memory.candidates.iter_mut() {
+        if internal_id.is_none_or(|target| target == id) && (health.input_tokens > 0 || health.output_tokens > 0)
+        {
+            health.input_tokens = 0;
+            health.output_tokens = 0;
+            changed = true;
+        }
+    }
+    if changed {
+        save_route_memory(&route_memory_path(), &memory);
+    }
+}
+
+/// Add usage tokens to a candidate's running total (persisted immediately —
+/// requests are rare enough that a small JSON write per response is fine).
+fn accumulate_usage(state: &AppState, internal_id: &str, input: u64, output: u64) {
+    if input == 0 && output == 0 {
+        return;
+    }
+    let Ok(mut memory) = state.route_memory.lock() else {
+        return;
+    };
+    let entry = memory.candidates.entry(internal_id.to_string()).or_default();
+    entry.input_tokens = entry.input_tokens.saturating_add(input);
+    entry.output_tokens = entry.output_tokens.saturating_add(output);
+    persist_route_memory(state, &memory);
+}
+
+/// Best-effort extraction of (prompt, completion) tokens from an upstream
+/// response body. Accepts OpenAI `usage.prompt_tokens/completion_tokens` and
+/// Anthropic `usage.input_tokens/output_tokens` shapes.
+fn usage_tokens_from_value(value: &Value) -> (u64, u64) {
+    let usage = value.get("usage");
+    let Some(usage) = usage else {
+        return (0, 0);
+    };
+    let num = |v: &Value| -> u64 {
+        v.as_f64().map(|n| n.max(0.0) as u64).unwrap_or_else(|| {
+            v.as_u64().unwrap_or(0)
+        })
+    };
+    let prompt = usage
+        .get("prompt_tokens")
+        .or_else(|| usage.get("input_tokens"));
+    let completion = usage
+        .get("completion_tokens")
+        .or_else(|| usage.get("output_tokens"));
+    let mut input = prompt.map(num).unwrap_or(0);
+    let output = completion.map(num).unwrap_or(0);
+    if input == 0 && output == 0 {
+        // last resort: a total with no split
+        input = usage.get("total_tokens").map(num).unwrap_or(0);
+    }
+    (input, output)
+}
+
+fn usage_tokens_from_bytes(bytes: &[u8]) -> (u64, u64) {
+    serde_json::from_slice::<Value>(bytes)
+        .map(|value| usage_tokens_from_value(&value))
+        .unwrap_or((0, 0))
+}
+
+/// Passive per-line scanner over an upstream SSE stream. Buffers partial lines
+/// across chunk boundaries and, whenever a complete `data: {…usage…}` frame
+/// passes through, adds its token counts to the candidate total. The upstream
+/// bytes are forwarded untouched.
+fn count_usage_stream<S, E>(
+    state: AppState,
+    candidate: Candidate,
+    stream: S,
+) -> impl Stream<Item = Result<Bytes, E>>
+where
+    S: Stream<Item = Result<Bytes, E>> + 'static,
+    E: 'static,
+{
+    // `unfold` keeps the partial-line buffer + probe state owned by the stream
+    // seed (no &mut borrow across an await, unlike `scan`).
+    type Seed<S> = (
+        std::pin::Pin<Box<S>>,
+        String,
+        AppState,
+        String,
+    );
+    let seed: Seed<S> = (Box::pin(stream), String::new(), state, candidate.internal_id);
+    stream::unfold(seed, move |mut seed: Seed<S>| async move {
+        let next = seed.0.next().await?;
+        let bytes = match next {
+            Ok(bytes) => bytes,
+            Err(error) => return Some((Err(error), seed)),
+        };
+        let state = seed.2.clone();
+        let candidate_id = seed.3.clone();
+        seed.1.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let Some(newline) = seed.1.find('\n') else {
+                break;
+            };
+            let line: String = seed.1.drain(..=newline).collect();
+            let trimmed = line.trim();
+            let Some(payload) = trimmed.strip_prefix("data:") else {
+                continue;
+            };
+            let payload = payload.trim();
+            if payload == "[DONE]" || !payload.contains("usage") {
+                continue;
+            }
+            if let Ok(value) = serde_json::from_str::<Value>(payload) {
+                let (input, output) = usage_tokens_from_value(&value);
+                if input > 0 || output > 0 {
+                    accumulate_usage(&state, &candidate_id, input, output);
+                }
+            }
+        }
+        Some((Ok(bytes), seed))
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +837,14 @@ async fn route_chat_with_policy(
         }
 
         if stream_requested {
-            let mut upstream_stream = response.bytes_stream();
+            // Pass every upstream byte through while passively tallying token
+            // usage seen in SSE frames. Box::pin so `.next()` works on the
+            // (non-Unpin) unfold stream.
+            let mut upstream_stream = Box::pin(count_usage_stream(
+                state.clone(),
+                candidate.clone(),
+                response.bytes_stream(),
+            ));
             let Some(first_byte_timeout) = remaining_timeout(
                 routing_started,
                 policy.time_budget,
@@ -758,6 +924,10 @@ async fn route_chat_with_policy(
         match tokio::time::timeout(body_timeout, response.bytes()).await {
             Ok(Ok(response_body)) => {
                 mark_success(state, &candidate);
+                let (input, output) = usage_tokens_from_bytes(&response_body);
+                if input > 0 || output > 0 {
+                    accumulate_usage(state, &candidate.internal_id, input, output);
+                }
                 return upstream_response(
                     status,
                     content_type,

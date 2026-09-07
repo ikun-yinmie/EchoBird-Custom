@@ -113,7 +113,14 @@ interface TipState {
   top: number; // y, relative to the grid root
 }
 
-export function ContributionHeatmap({ buckets }: { buckets: DayBuckets }) {
+export function ContributionHeatmap({
+  buckets,
+  onDayClick,
+}: {
+  buckets: DayBuckets;
+  /** Fired when the user clicks a day with activity (date is YYYY-MM-DD). */
+  onDayClick?: (date: string, count: number) => void;
+}) {
   const { t, locale } = useI18n();
   const grid = useMemo(() => buildGrid(buckets), [buckets]);
   // Column-major flatten: grid[col][row] → fills the CSS grid top-to-bottom
@@ -258,6 +265,11 @@ export function ContributionHeatmap({ buckets }: { buckets: DayBuckets }) {
                 cx: cb.left - rb.left + cb.width / 2,
                 top: cb.top - rb.top - 4,
               });
+            }}
+            onClick={() => {
+              if (!cell.future && cell.count > 0 && onDayClick) {
+                onDayClick(cell.date, cell.count);
+              }
             }}
             style={{
               borderRadius: 3,

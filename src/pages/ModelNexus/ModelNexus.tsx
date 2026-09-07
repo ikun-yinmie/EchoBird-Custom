@@ -3,7 +3,10 @@
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { open as shellOpen } from '@tauri-apps/plugin-shell';
-import { readText as readClipboardText } from '@tauri-apps/plugin-clipboard-manager';
+import {
+  readText as readClipboardText,
+  writeText as writeClipboardText,
+} from '@tauri-apps/plugin-clipboard-manager';
 import {
   DndContext,
   PointerSensor,
@@ -59,6 +62,31 @@ const isValidModelBaseUrl = (value: string) => {
   }
 };
 
+type ModelAddressFormat = 'openai' | 'anthropic' | 'gemini';
+type ModelOpenAiSub = 'chat' | 'responses';
+
+// Format choices for the single merged address field. Brand names are
+// locale-neutral so they render as-is in every language.
+const MODEL_ADDRESS_FORMATS: { id: ModelAddressFormat; label: string }[] = [
+  { id: 'openai', label: 'OpenAI' },
+  { id: 'anthropic', label: 'Anthropic' },
+  { id: 'gemini', label: 'Gemini' },
+];
+
+// Best-guess format when the edit/directory-add modal opens for an existing
+// entry: anthropic-only → anthropic; a Google OpenAI-compatible endpoint →
+// gemini; otherwise openai (responses when the base ends with /responses).
+const inferAddressFormat = (model: {
+  baseUrl?: string;
+  anthropicUrl?: string;
+}): { format: ModelAddressFormat; sub: ModelOpenAiSub } => {
+  const base = model.baseUrl || '';
+  const anthropic = model.anthropicUrl || '';
+  if (!base && anthropic) return { format: 'anthropic', sub: 'chat' };
+  if (/generativelanguage/i.test(base)) return { format: 'gemini', sub: 'chat' };
+  return { format: 'openai', sub: /\/responses\/?$/i.test(base) ? 'responses' : 'chat' };
+};
+
 export function ModelNexusProvider({ children }: { children: React.ReactNode }) {
   // Models state
   const [userModels, setUserModels] = useState<ModelConfig[]>([]);
@@ -73,6 +101,7 @@ export function ModelNexusProvider({ children }: { children: React.ReactNode }) 
   const [refreshingUsageIds, setRefreshingUsageIds] = useState<Set<string>>(new Set());
   // Volcengine AK/SK (per-model: one account per model)
   const { showToast } = useToast();
+  const { t } = useI18n();
   const [volcAkSkMissingIds, setVolcAkSkMissingIds] = useState<Set<string>>(new Set());
   const [volcAkSkModelId, setVolcAkSkModelId] = useState<string | null>(null);
 
@@ -215,6 +244,59 @@ export function ModelNexusProvider({ children }: { children: React.ReactNode }) 
     }
     setPingingModelIds(new Set());
     setIsTesting(false);
+  };
+
+  // Single-model latency test — mirrors one iteration of pingAllModels so a
+  // per-card [测速] button shows the same matrix-decode + latency UX.
+  const pingSingleModel = async (modelId: string) => {
+    if (pingingModelIds.has(modelId)) return;
+    setPingingModelIds((prev) => new Set(prev).add(modelId));
+    try {
+      const result = await api.pingModel(modelId);
+      // -1 is the "tested and failed" sentinel (see pingAllModels).
+      setModelLatencies((prev) => ({
+        ...prev,
+        [modelId]: result?.success ? result.latency : -1,
+      }));
+    } catch {
+      setModelLatencies((prev) => ({ ...prev, [modelId]: -1 }));
+    } finally {
+      setPingingModelIds((prev) => {
+        const next = new Set(prev);
+        next.delete(modelId);
+        return next;
+      });
+    }
+  };
+
+  // Copy connection info (endpoint + model id + key) so it can be pasted
+  // straight into a tool/config. Encrypted keys are decrypted for the copy;
+  // destroyed keys just omit the API_KEY line.
+  const copyModelConnection = async (internalId: string) => {
+    const model = userModels.find((m) => m.internalId === internalId);
+    if (!model) return;
+    let plainKey = model.apiKey || '';
+    if (plainKey.startsWith('enc:v1:')) {
+      try {
+        plainKey = (await api.decryptSecret(plainKey)) || '';
+      } catch {
+        plainKey = '';
+      }
+    }
+    const lines = [
+      `# ${model.name}`,
+      model.baseUrl && `BASE_URL=${model.baseUrl}`,
+      model.anthropicUrl && `ANTHROPIC_URL=${model.anthropicUrl}`,
+      model.modelId && `MODEL_ID=${model.modelId}`,
+      plainKey && `API_KEY=${plainKey}`,
+    ].filter((line): line is string => Boolean(line));
+    try {
+      await writeClipboardText(lines.join('\n'));
+      showToast('success', t('model.copyOk'));
+    } catch (error) {
+      console.error('Copy connection info failed:', error);
+      showToast('error', t('error.requestFailed'));
+    }
   };
 
   // Refresh usage for all models
@@ -428,9 +510,11 @@ export function ModelNexusProvider({ children }: { children: React.ReactNode }) 
         setKeyDestroyed,
         closeModelModal,
         pingAllModels,
+        pingSingleModel,
         refreshAllUsage,
         refreshSingleUsage,
         handleTestModel,
+        copyModelConnection,
       }}
     >
       {children}
@@ -703,6 +787,8 @@ export function ModelNexusMain() {
     volcAkSkModelId,
     setVolcAkSkModelId,
     saveVolcAksk,
+    pingSingleModel,
+    copyModelConnection,
   } = useModelNexus();
 
   // Pre-fill values for the AK/SK modal (fetched when opening for a model).
@@ -742,12 +828,15 @@ export function ModelNexusMain() {
       } else {
         setKeyDestroyed(false);
       }
+      const inferred = inferAddressFormat(freshModel);
       setNewModelForm({
         name: freshModel.name,
         baseUrl: freshModel.baseUrl,
         anthropicUrl: freshModel.anthropicUrl || '',
         apiKey: freshModel.apiKey,
         modelId: freshModel.modelId || '',
+        addressFormat: inferred.format,
+        openaiSub: inferred.sub,
       });
       setShowAddModelModal(true);
     },
@@ -832,6 +921,8 @@ export function ModelNexusMain() {
         dragHandlePad
         onEdit={isDemo ? undefined : () => handleCardEdit(model)}
         onDelete={isDemo ? undefined : () => handleCardDelete(model.internalId)}
+        onPing={isDemo ? undefined : () => pingSingleModel(model.internalId)}
+        onCopy={isDemo ? undefined : () => copyModelConnection(model.internalId)}
         onRefresh={() => refreshSingleUsage(model.internalId)}
         isRefreshingUsage={refreshingUsageIds.has(model.internalId)}
         onAccessKey={
@@ -892,6 +983,8 @@ export function ModelNexusMain() {
                       anthropicUrl: '',
                       apiKey: '',
                       modelId: '',
+                      addressFormat: 'openai',
+                      openaiSub: 'chat',
                     });
                     setEditingModelId(null);
                     setShowAddModelModal(true);
@@ -1084,6 +1177,7 @@ export function ModelNexusPanel() {
   const handleAddFromEntry = useCallback(
     (entry: DirectoryEntry) => {
       const options = entry.modelIds ?? [];
+      const inferred = inferAddressFormat(entry);
       setNewModelForm({
         name: entry.name,
         baseUrl: entry.baseUrl,
@@ -1092,6 +1186,8 @@ export function ModelNexusPanel() {
         // Default to the curated default, else the first listed id, else blank.
         modelId: entry.modelId || options[0] || '',
         modelIdOptions: options,
+        addressFormat: inferred.format,
+        openaiSub: inferred.sub,
       });
       setEditingModelId(null);
       setShowAddModelModal(true);
@@ -1142,6 +1238,7 @@ export function AddModelModal() {
   const { t } = useI18n();
   const { showToast } = useToast();
   const [isSavingModel, setIsSavingModel] = useState(false);
+  const [isFetchingModelIds, setIsFetchingModelIds] = useState(false);
   const { addSelectedModel, selectedIds } = useFreeModels();
   const {
     showAddModelModal,
@@ -1160,36 +1257,108 @@ export function AddModelModal() {
 
   if (!showAddModelModal) return null;
 
-  // One-click paste affordance for the modal's free-text fields. Plain text,
-  // no button styling / hover effect — the label never changes. The `normalize`
-  // arg lets a URL field run the pasted text through the SAME normalization the
-  // typing path uses, so a pasted full endpoint (`/v1/chat/completions`) is
-  // trimmed to a clean base instead of silently keeping a doubled path that
-  // would 404 every request while manually typed URLs work.
-  //
-  // These URL fields have NO overlay control to their right (unlike the API
-  // key field, which has the encrypt/decrypt lock button at right-2), so the
-  // paste label sits flush at the right edge — right-2 — and the input keeps
-  // enough right padding (pr-16) to clear the widest locale's "貼り付け" text.
-  const pasteButton = (field: 'baseUrl' | 'anthropicUrl', normalize: (v: string) => string) => (
-    <button
-      type="button"
-      onClick={async () => {
-        try {
-          const text = (await readClipboardText()).trim();
-          if (text) {
-            const v = normalize(text);
-            setNewModelForm((prev) => ({ ...prev, [field]: v }));
-          }
-        } catch {
-          /* clipboard empty / unreadable — no-op */
-        }
-      }}
-      className="absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer text-xs text-cyber-text-secondary"
-    >
-      {t('model.paste')}
-    </button>
-  );
+  // ── Single merged address field ──
+  // One input whose protocol follows the format switch below. OpenAI chat /
+  // responses and Gemini addresses all live in baseUrl (Google serves Gemini
+  // through an OpenAI-compatible endpoint); Anthropic lives in anthropicUrl.
+  // Switching formats never discards the other slot's stored value.
+  const addressFormat: ModelAddressFormat =
+    newModelForm.addressFormat ??
+    (newModelForm.anthropicUrl && !newModelForm.baseUrl ? 'anthropic' : 'openai');
+  const openaiSub: ModelOpenAiSub =
+    newModelForm.openaiSub ??
+    (/\/responses\/?$/i.test(newModelForm.baseUrl) ? 'responses' : 'chat');
+
+  const addressValue =
+    addressFormat === 'anthropic' ? newModelForm.anthropicUrl : newModelForm.baseUrl;
+
+  const addressPlaceholder =
+    addressFormat === 'anthropic'
+      ? 'https://x.x.com/anthropic'
+      : addressFormat === 'gemini'
+        ? 'https://generativelanguage.googleapis.com/v1beta/openai'
+        : openaiSub === 'responses'
+          ? 'https://x.x.com/v1/responses'
+          : 'https://x.x.com/v1';
+
+  // Normalize a typed/pasted address for the active format. Only the call
+  // suffix (chat/completions) is stripped — a responses-mode base such as
+  // https://x.x.com/v1/responses is kept verbatim, and Anthropic collapses
+  // to the bare host as before.
+  const normalizeAddress = (value: string): string => {
+    if (addressFormat === 'anthropic') return normalizeAnthropicUrl(value);
+    return normalizeOpenaiUrl(value);
+  };
+
+  const setAddressValue = (value: string) => {
+    const v = normalizeAddress(value);
+    setNewModelForm((prev) =>
+      addressFormat === 'anthropic' ? { ...prev, anthropicUrl: v } : { ...prev, baseUrl: v }
+    );
+  };
+
+  const switchAddressFormat = (next: ModelAddressFormat) => {
+    setNewModelForm((prev) => {
+      // The outgoing slot already holds its latest text (onChange wrote it);
+      // only the format/sub-mode selection flips. The OpenAI sub-mode is
+      // kept when the user moves OpenAI → Gemini → OpenAI again.
+      const wasOpenAi = (prev.addressFormat ?? 'openai') !== 'anthropic';
+      return {
+        ...prev,
+        addressFormat: next,
+        openaiSub:
+          next === 'openai' ? (wasOpenAi ? (prev.openaiSub ?? 'chat') : 'chat') : undefined,
+      };
+    });
+  };
+
+  const pasteAddress = async () => {
+    try {
+      const text = (await readClipboardText()).trim();
+      if (text) setAddressValue(text);
+    } catch {
+      /* clipboard empty / unreadable — no-op */
+    }
+  };
+
+  // 获取模型: list the ids served by the typed address. A missing API key is
+  // not a hard block (keyless local / OSS endpoints may still list), but when
+  // the request fails with no key on the form we say so plainly — once a key
+  // is present, the raw endpoint error is surfaced as-is.
+  const handleFetchModelIds = async () => {
+    const address = addressValue.trim();
+    if (!address) {
+      showToast('warning', t('model.addressRequired'));
+      return;
+    }
+    const hasKey = newModelForm.apiKey.trim().length > 0;
+    // Always hit <host>/models regardless of which call-style suffix the
+    // address carries (chat completions / responses / none).
+    const base = address
+      .replace(/\/v1\/chat\/completions\/?$/i, '/v1')
+      .replace(/\/chat\/completions\/?$/i, '')
+      .replace(/\/responses\/?$/i, '');
+    setIsFetchingModelIds(true);
+    try {
+      const ids = await api.listRemoteModels(base, newModelForm.apiKey);
+      if (ids.length > 0) {
+        setNewModelForm((prev) => ({ ...prev, modelIdOptions: ids }));
+        showToast('success', t('model.fetchOk').replace('{count}', String(ids.length)));
+      } else {
+        setNewModelForm((prev) => ({ ...prev, modelIdOptions: [] }));
+        showToast('warning', t('model.fetchEmpty'));
+      }
+    } catch (err) {
+      if (!hasKey) {
+        showToast('warning', t('model.fetchNeedKey'));
+        return;
+      }
+      const message = err instanceof Error ? err.message : String(err);
+      showToast('error', message || t('error.requestFailed'));
+    } finally {
+      setIsFetchingModelIds(false);
+    }
+  };
 
   return (
     <div
@@ -1248,49 +1417,99 @@ export function AddModelModal() {
               />
             </div>
             <div>
-              <label className="block text-xs text-cyber-text-secondary mb-1">
-                {t('model.openaiUrl')}
-              </label>
+              <div className="flex items-center justify-between mb-1 flex-wrap gap-x-2 gap-y-1">
+                <label className="text-xs text-cyber-text-secondary">{t('model.address')}</label>
+                <div
+                  role="radiogroup"
+                  aria-label={t('model.address')}
+                  className="flex items-center gap-1 flex-wrap"
+                >
+                  {MODEL_ADDRESS_FORMATS.map((f) => (
+                    <button
+                      key={f.id}
+                      type="button"
+                      role="radio"
+                      aria-checked={addressFormat === f.id}
+                      onClick={() => switchAddressFormat(f.id)}
+                      className={`px-2 py-0.5 text-[11px] rounded-md transition-colors outline-none ${
+                        addressFormat === f.id
+                          ? 'bg-cyber-text/15 text-cyber-text font-bold'
+                          : 'text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                  {addressFormat === 'openai' && (
+                    <>
+                      <span aria-hidden className="w-px h-3.5 bg-cyber-border mx-0.5" />
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={openaiSub === 'chat'}
+                        onClick={() => setNewModelForm((prev) => ({ ...prev, openaiSub: 'chat' }))}
+                        className={`px-2 py-0.5 text-[11px] rounded-md transition-colors outline-none ${
+                          openaiSub === 'chat'
+                            ? 'bg-cyber-text/15 text-cyber-text font-bold'
+                            : 'text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10'
+                        }`}
+                      >
+                        {t('model.openaiChat')}
+                      </button>
+                      <button
+                        type="button"
+                        role="radio"
+                        aria-checked={openaiSub === 'responses'}
+                        onClick={() =>
+                          setNewModelForm((prev) => ({ ...prev, openaiSub: 'responses' }))
+                        }
+                        className={`px-2 py-0.5 text-[11px] rounded-md transition-colors outline-none ${
+                          openaiSub === 'responses'
+                            ? 'bg-cyber-text/15 text-cyber-text font-bold'
+                            : 'text-cyber-text-secondary hover:text-cyber-text hover:bg-cyber-text/10'
+                        }`}
+                      >
+                        {t('model.openaiResponses')}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
               <div className="relative">
                 <input
                   type="text"
-                  placeholder="https://x.x.com/v1"
-                  value={newModelForm.baseUrl}
-                  onChange={(e) =>
-                    setNewModelForm((prev) => ({
-                      ...prev,
-                      baseUrl: normalizeOpenaiUrl(e.target.value),
-                    }))
-                  }
+                  placeholder={addressPlaceholder}
+                  value={addressValue}
+                  onChange={(e) => setAddressValue(e.target.value)}
                   className="w-full bg-cyber-input border border-cyber-border px-2 py-1.5 pr-16 text-xs text-cyber-text font-mono focus:border-cyber-border focus:outline-none rounded-button"
                 />
-                {pasteButton('baseUrl', normalizeOpenaiUrl)}
+                <button
+                  type="button"
+                  tabIndex={-1}
+                  onClick={() => void pasteAddress()}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 cursor-pointer text-xs text-cyber-text-secondary"
+                >
+                  {t('model.paste')}
+                </button>
               </div>
             </div>
             <div>
-              <label className="block text-xs text-cyber-text-secondary mb-1">
-                {t('model.anthropicUrl')}
-              </label>
-              <div className="relative">
-                <input
-                  type="text"
-                  placeholder="https://x.x.com/anthropic"
-                  value={newModelForm.anthropicUrl}
-                  onChange={(e) =>
-                    setNewModelForm((prev) => ({
-                      ...prev,
-                      anthropicUrl: normalizeAnthropicUrl(e.target.value),
-                    }))
-                  }
-                  className="w-full bg-cyber-input border border-cyber-border px-2 py-1.5 pr-16 text-xs text-cyber-text font-mono focus:border-cyber-border focus:outline-none rounded-button"
-                />
-                {pasteButton('anthropicUrl', normalizeAnthropicUrl)}
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs text-cyber-text-secondary">{t('model.modelId')}</label>
+                <button
+                  type="button"
+                  disabled={isFetchingModelIds}
+                  onClick={() => void handleFetchModelIds()}
+                  className={`flex items-center gap-1 text-[11px] transition-colors outline-none ${
+                    isFetchingModelIds
+                      ? 'text-cyber-text-muted cursor-not-allowed'
+                      : 'text-cyber-accent hover:text-cyber-accent-secondary'
+                  }`}
+                >
+                  <RefreshCw size={11} className={isFetchingModelIds ? 'animate-spin' : ''} />
+                  {t('model.fetchModels')}
+                </button>
               </div>
-            </div>
-            <div>
-              <label className="block text-xs text-cyber-text-secondary mb-1">
-                {t('model.modelId')}
-              </label>
               {/* Single searchable combobox: free-type any id, with a filtered
                   suggestion dropdown when the clicked directory entry carries a
                   model id list. No options → plain input. */}
@@ -1424,17 +1643,19 @@ export function AddModelModal() {
             disabled={isSavingModel}
             onClick={async () => {
               if (isSavingModel) return;
+              const saveAddress = addressValue.trim();
+              const isAnthropic = addressFormat === 'anthropic';
               if (
                 !newModelForm.name.trim() ||
-                !newModelForm.baseUrl.trim() ||
+                !saveAddress ||
                 !newModelForm.modelId.trim() ||
                 !newModelForm.apiKey.trim()
               ) {
                 showToast('warning', t('model.requiredFields'));
                 return;
               }
-              if (!isValidModelBaseUrl(newModelForm.baseUrl)) {
-                showToast('warning', t('model.invalidOpenaiUrl'));
+              if (!isValidModelBaseUrl(saveAddress)) {
+                showToast('warning', t('model.invalidAddress'));
                 return;
               }
               if (
@@ -1449,10 +1670,12 @@ export function AddModelModal() {
               setIsSavingModel(true);
               try {
                 if (editingModelId) {
+                  // Single merged address → its stored slot by active format;
+                  // the untouched slot is preserved when editing.
                   const updatedModel = await api.updateModel(editingModelId, {
                     name: newModelForm.name,
-                    baseUrl: newModelForm.baseUrl,
-                    anthropicUrl: newModelForm.anthropicUrl,
+                    baseUrl: isAnthropic ? newModelForm.baseUrl : saveAddress,
+                    anthropicUrl: isAnthropic ? saveAddress : newModelForm.anthropicUrl,
                     apiKey: newModelForm.apiKey,
                     modelId: newModelForm.modelId,
                   });
@@ -1464,8 +1687,8 @@ export function AddModelModal() {
                 } else {
                   const newModel = await api.addModel({
                     name: newModelForm.name,
-                    baseUrl: newModelForm.baseUrl,
-                    anthropicUrl: newModelForm.anthropicUrl || undefined,
+                    baseUrl: isAnthropic ? '' : saveAddress,
+                    anthropicUrl: isAnthropic ? saveAddress : undefined,
                     apiKey: newModelForm.apiKey,
                     modelId: newModelForm.modelId,
                     scope: modelModalDestination === 'freeRouter' ? 'smartRouter' : 'modelCenter',
@@ -1496,6 +1719,8 @@ export function AddModelModal() {
                   anthropicUrl: '',
                   apiKey: '',
                   modelId: '',
+                  addressFormat: 'openai',
+                  openaiSub: 'chat',
                 });
                 setShowAddModelModal(false);
                 setModelModalDestination('modelNexus');

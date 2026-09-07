@@ -1,38 +1,29 @@
-// Feedback page — guides users to capture failing logs and submit them
-// as a GitHub issue. Two-step flow:
+// Feedback page — guides users to capture failing logs and send them to the
+// admin mailbox. Two-step flow:
 //   1. Copy last 30 backend log lines straight to clipboard (the same
 //      stream that appears in the dev-mode CMD window, sourced from
 //      `<app_log_dir>/echobird.log`).
-//   2. Open the project repo Issues page (GitHub primary; Gitcode for
-//      zh users; email for non-zh users) so they can paste + describe.
+//   2. Copy the admin mailbox (admin@xinjk.de5.net) and compose an email
+//      there with the copied logs + a short description.
 
 import { useState } from 'react';
-import { Check, ClipboardCopy, ExternalLink, Mail } from 'lucide-react';
-import { open as shellOpen } from '@tauri-apps/plugin-shell';
+import { Check, ClipboardCopy, Mail } from 'lucide-react';
 import { useI18n } from '../../hooks/useI18n';
 import { useToast } from '../../components/Toast';
 import { readLogTail } from '../../api/tauri';
 import { copyText } from '../../utils/copyText';
 
-const GITHUB_ISSUES_URL = 'https://github.com/edison7009/EchoBird/issues/new';
-// Mainland China users frequently can't reach github.com — Gitcode mirror
-// is the primary alternative; shown only under Chinese locale.
-const GITCODE_ISSUES_URL = 'https://gitcode.com/edison7009/EchoBird/issues/create';
-// English-locale fallback when GitHub is unreachable: direct email.
-const SUPPORT_EMAIL = 'hi@echobird.ai';
+// Admin mailbox that receives feedback emails (with the copied log tail).
+const SUPPORT_EMAIL = 'admin@xinjk.de5.net';
 // Lines of backend log to copy. 30 is empirically enough to capture
-// one user action + its failure trail without overflowing an issue body.
+// one user action + its failure trail without overflowing an email body.
 const LOG_TAIL_LINES = 30;
 
-const openExternal = (url: string) => shellOpen(url).catch(() => window.open(url, '_blank'));
-
 export function FeedbackMain() {
-  const { t, locale } = useI18n();
+  const { t } = useI18n();
   const { showToast } = useToast();
-  // Gitcode mirror only useful for mainland (GFW-blocked GitHub). TW/HK/MO
-  // and JP users reach github.com directly, so they get the email fallback.
-  const isZh = locale === 'zh-Hans';
   const [justCopied, setJustCopied] = useState(false);
+  const [emailCopied, setEmailCopied] = useState(false);
 
   const copyLogTail = async () => {
     try {
@@ -77,7 +68,7 @@ export function FeedbackMain() {
 
       <section className="rounded-lg border border-cyber-border bg-cyber-bg-secondary/40 p-5 space-y-3">
         <div className="flex items-center gap-2">
-          <ExternalLink size={18} className="text-cyber-accent" />
+          <Mail size={18} className="text-cyber-accent" />
           <h2 className="font-semibold">{t('feedback.step2.title')}</h2>
         </div>
         <p className="text-sm text-cyber-text-secondary leading-relaxed">
@@ -85,44 +76,28 @@ export function FeedbackMain() {
         </p>
         <div className="flex flex-wrap items-center gap-2">
           <button
-            onClick={() => openExternal(GITHUB_ISSUES_URL)}
+            onClick={() => {
+              // Copy the email address to clipboard rather than firing a
+              // mailto: URL — most users don't have a desktop mail client
+              // configured, and a missing handler launches OS picker noise.
+              void copyText(SUPPORT_EMAIL).then((ok) => {
+                setEmailCopied(ok);
+                showToast(
+                  ok ? 'success' : 'error',
+                  t(ok ? 'feedback.step1.copied' : 'feedback.step1.failed')
+                );
+                if (ok) window.setTimeout(() => setEmailCopied(false), 2000);
+              });
+            }}
             className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-cyber-accent/15 hover:bg-cyber-accent/25 border border-cyber-accent/40 text-cyber-accent transition-colors text-sm font-medium"
           >
-            <ExternalLink size={14} />
-            {t('feedback.step2.button')}
+            {emailCopied ? <Check size={14} /> : <Mail size={14} />}
+            {emailCopied ? t('feedback.step1.copied') : t('feedback.step2.button')}
           </button>
-          {/* Locale-specific fallback channel:
-              • zh users: Gitcode mirror (github.com is often unreachable from CN)
-              • non-zh users: email (no widely-used GitHub mirror outside CN) */}
-          {isZh ? (
-            <button
-              onClick={() => openExternal(GITCODE_ISSUES_URL)}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-cyber-bg-secondary/60 hover:bg-cyber-bg-secondary border border-cyber-border text-cyber-text-secondary hover:text-cyber-text transition-colors text-sm font-medium"
-            >
-              <ExternalLink size={14} />
-              {t('feedback.step2.fallbackButton')}
-            </button>
-          ) : (
-            <button
-              onClick={() => {
-                // Copy the email address to clipboard rather than firing a
-                // mailto: URL — most users don't have a desktop mail client
-                // configured, and a missing handler launches OS picker noise.
-                void copyText(SUPPORT_EMAIL).then((ok) =>
-                  showToast(
-                    ok ? 'success' : 'error',
-                    t(ok ? 'feedback.step1.copied' : 'feedback.step1.failed')
-                  )
-                );
-              }}
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-md bg-cyber-bg-secondary/60 hover:bg-cyber-bg-secondary border border-cyber-border text-cyber-text-secondary hover:text-cyber-text transition-colors text-sm font-medium"
-            >
-              <Mail size={14} />
-              {SUPPORT_EMAIL}
-            </button>
-          )}
         </div>
-        <p className="text-xs text-cyber-text-muted pt-1">{t('feedback.networkNote')}</p>
+        <div className="rounded-md border border-cyber-border/60 bg-cyber-bg-secondary/60 px-3 py-2.5 text-sm font-mono text-cyber-text-secondary select-all">
+          {SUPPORT_EMAIL}
+        </div>
       </section>
     </div>
   );

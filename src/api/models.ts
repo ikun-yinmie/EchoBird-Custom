@@ -48,6 +48,15 @@ export async function testModel(
   return invoke('test_model', { internalId, prompt, protocol });
 }
 
+/**
+ * List model ids advertised by an OpenAI-compatible `/models` endpoint,
+ * using the raw URL + key from the Add-Model form (an `enc:v1:` key is
+ * decrypted backend-side). Feeds the model-id combobox suggestions.
+ */
+export async function listRemoteModels(baseUrl: string, apiKey: string): Promise<string[]> {
+  return invoke('list_remote_models', { baseUrl, apiKey });
+}
+
 /** Persist a user-defined model display order (full visible list of
  *  internal_ids in the new order). */
 export async function reorderModels(orderedIds: string[]): Promise<boolean> {

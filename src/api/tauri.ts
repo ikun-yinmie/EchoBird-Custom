@@ -42,6 +42,37 @@ export async function restoreToolToOfficial(
   return invoke('restore_tool_to_official', { toolId });
 }
 
+/// How a tool can be uninstalled (mirrors the Rust UninstallInfo).
+export interface ToolUninstallInfo {
+  available: boolean;
+  /** 'registry' (Windows vendor uninstaller) | 'npm' (global npm package) */
+  method?: 'registry' | 'npm';
+  /** npm package name, or the registry DisplayName on Windows */
+  detail?: string;
+  /** Machine-readable reason when !available: 'unknown_tool' | 'builtin' | 'no-method' */
+  reasonCode?: string;
+}
+
+/// Describe how a tool can be uninstalled, without doing anything.
+export async function getToolUninstallInfo(toolId: string): Promise<ToolUninstallInfo> {
+  return invoke('get_tool_uninstall_info', { toolId });
+}
+
+/// Run the tool's uninstaller. Windows spawns the vendor uninstall wizard
+/// (rescan after it finishes); npm waits for `npm uninstall -g`.
+export async function uninstallTool(
+  toolId: string
+): Promise<{ success: boolean; message: string }> {
+  return invoke('uninstall_tool', { toolId });
+}
+
+/// Launch a user-added custom desktop app by spawning its executable
+/// directly (never through a shell). The path comes from the native file
+/// picker.
+export async function launchCustomApp(path: string): Promise<void> {
+  return invoke('launch_custom_app', { path });
+}
+
 // ─── Process APIs ───
 
 export async function startTool(

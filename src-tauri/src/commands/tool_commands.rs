@@ -114,6 +114,47 @@ pub async fn scan_tools() -> Result<Vec<DetectedTool>, String> {
     Ok(tool_manager::scan_tools().await)
 }
 
+/// Describe how a tool can be uninstalled (Windows vendor uninstaller /
+/// global npm package), without doing anything. The frontend uses this to
+/// enable the desktop right-click "uninstall" item or show why it's disabled.
+#[tauri::command]
+pub async fn tool_uninstall_info(tool_id: String) -> Result<tool_manager::UninstallInfo, String> {
+    Ok(tool_manager::tool_uninstall_info(&tool_id).await)
+}
+
+/// Run the tool's uninstaller. Windows spawns the vendor uninstall wizard
+/// (interactive — rescan after it finishes); npm waits for
+/// `npm uninstall -g` to complete. Always returns Ok with a success flag —
+/// transport errors surface as Err, uninstall failures as success:false.
+#[tauri::command]
+pub async fn uninstall_tool(tool_id: String) -> Result<ApplyResult, String> {
+    match tool_manager::run_tool_uninstall(&tool_id).await {
+        Ok(message) => Ok(ApplyResult {
+            success: true,
+            message,
+        }),
+        Err(message) => Ok(ApplyResult {
+            success: false,
+            message,
+        }),
+    }
+}
+
+/// Launch a user-added custom desktop app (the "+" tile) by spawning its
+/// executable directly. The path comes from the native file picker and is
+/// passed as argv[0] — never through a shell, so no injection surface.
+#[tauri::command]
+pub async fn launch_custom_app(path: String) -> Result<(), String> {
+    let p = std::path::Path::new(&path);
+    if !p.is_file() {
+        return Err(format!("File does not exist: {}", path));
+    }
+    std::process::Command::new(p)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch {path}: {e}"))
+}
+
 /// Apply a model configuration to a tool
 #[tauri::command]
 pub async fn apply_model_to_tool(

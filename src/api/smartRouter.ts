@@ -19,6 +19,12 @@ export interface SmartRouterActivity {
   updatedAtMs: number;
 }
 
+export interface SmartRouterTokenStat {
+  internalId: string;
+  inputTokens: number;
+  outputTokens: number;
+}
+
 export async function getSmartRouterConfig(): Promise<SmartRouterConfig> {
   return invoke('get_smart_router_config');
 }
@@ -35,6 +41,17 @@ export async function setSmartRouterCandidates(candidateIds: string[]): Promise<
 
 export async function getSmartRouterCandidates(): Promise<ModelConfig[]> {
   return invoke('get_smart_router_candidates');
+}
+
+export async function getSmartRouterTokenStats(): Promise<SmartRouterTokenStat[]> {
+  return invoke('get_smart_router_token_stats');
+}
+
+export async function resetSmartRouterTokenStats(internalId?: string): Promise<boolean> {
+  const result = await invoke<boolean>('reset_smart_router_token_stats', {
+    internalId: internalId ?? null,
+  });
+  return result;
 }
 
 export async function removeSmartRouterCandidate(internalId: string): Promise<SmartRouterConfig> {

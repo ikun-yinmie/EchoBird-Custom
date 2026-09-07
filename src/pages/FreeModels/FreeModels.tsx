@@ -414,6 +414,34 @@ export function FreeModelsMain() {
     updatedAtMs: 0,
   });
   const [activityObservedAtMs, setActivityObservedAtMs] = useState(0);
+  // Token usage tallied by the router proxy (per candidate + aggregate).
+  const [routerTokenStats, setRouterTokenStats] = useState<api.SmartRouterTokenStat[]>([]);
+  // Per-candidate latency probe results (per-node [测速]). -1 = tested & failed.
+  const [nodeLatencies, setNodeLatencies] = useState<Record<string, number>>({});
+  const [pingingNodeIds, setPingingNodeIds] = useState<Set<string>>(new Set());
+
+  const pingNode = useCallback(async (node: RouteModelNode) => {
+    setPingingNodeIds((prev) => {
+      const next = new Set(prev);
+      next.add(node.id);
+      return next;
+    });
+    try {
+      const result = await api.pingModel(node.internalId);
+      setNodeLatencies((prev) => ({
+        ...prev,
+        [node.id]: result?.success ? result.latency : -1,
+      }));
+    } catch {
+      setNodeLatencies((prev) => ({ ...prev, [node.id]: -1 }));
+    } finally {
+      setPingingNodeIds((prev) => {
+        const next = new Set(prev);
+        next.delete(node.id);
+        return next;
+      });
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -431,6 +459,14 @@ export function FreeModelsMain() {
           console.error('Load smart router activity failed:', error);
         }
       }
+      try {
+        const stats = await api.getSmartRouterTokenStats();
+        if (!cancelled) {
+          setRouterTokenStats(stats);
+        }
+      } catch (error) {
+        if (!cancelled) console.error('Load smart router token stats failed:', error);
+      }
     };
     void pollActivity();
     const timer = window.setInterval(() => void pollActivity(), ROUTER_ACTIVITY_POLL_MS);
@@ -438,6 +474,27 @@ export function FreeModelsMain() {
       cancelled = true;
       window.clearInterval(timer);
     };
+  }, []);
+
+  const tokenByNode = useMemo(() => {
+    const map: Record<string, number> = {};
+    for (const stat of routerTokenStats) {
+      map[stat.internalId] = (map[stat.internalId] || 0) + stat.inputTokens + stat.outputTokens;
+    }
+    return map;
+  }, [routerTokenStats]);
+  const totalTokens = useMemo(
+    () => Object.values(tokenByNode).reduce((sum, tokens) => sum + tokens, 0),
+    [tokenByNode]
+  );
+
+  const resetRouterTokens = useCallback(async (internalId?: string) => {
+    try {
+      await api.resetSmartRouterTokenStats(internalId);
+      setRouterTokenStats(await api.getSmartRouterTokenStats());
+    } catch (error) {
+      console.error('Reset smart router token stats failed:', error);
+    }
   }, []);
 
   const setNodeRef = useCallback((id: string, node: HTMLDivElement | null) => {
@@ -576,7 +633,9 @@ export function FreeModelsMain() {
       cancelAnimationFrame(frame);
       observer.disconnect();
     };
-  }, [selectedModels, updatePaths]);
+    // Node content height changes when a latency probe lands, so recompute the
+    // wiring after probe state settles too.
+  }, [selectedModels, updatePaths, nodeLatencies, pingingNodeIds]);
 
   const activityIsVisible =
     routerActivity.candidateId !== null &&
@@ -640,6 +699,20 @@ export function FreeModelsMain() {
           <div className="mt-3 space-y-1.5 text-center text-[10px] font-mono free-model-router-state">
             <div className="whitespace-nowrap">OpenAI : {routerBaseUrl}</div>
             <div className="whitespace-nowrap">Anthropic : {routerAnthropicBaseUrl}</div>
+            <div className="whitespace-nowrap flex items-center justify-center gap-1.5">
+              <span>Tokens : {totalTokens.toLocaleString()}</span>
+              {totalTokens > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void resetRouterTokens()}
+                  title={t('btn.resetTokens')}
+                  aria-label={t('btn.resetTokens')}
+                  className="text-cyber-text-muted hover:text-cyber-accent transition-colors"
+                >
+                  <RefreshCw size={10} />
+                </button>
+              )}
+            </div>
           </div>
         </div>
 
@@ -688,6 +761,58 @@ export function FreeModelsMain() {
                     </div>
                     <div className="mt-1 text-[10px] text-cyber-text-muted truncate">
                       {model.provider}
+                    </div>
+                    {/* Approximate tokens routed through this candidate */}
+                    {tokenByNode[model.id] ? (
+                      <div className="mt-1 text-[10px] text-cyber-text-muted/80 truncate flex items-center gap-1.5">
+                        <span>{tokenByNode[model.id].toLocaleString()} tok</span>
+                        <button
+                          type="button"
+                          onClick={() => void resetRouterTokens(model.id)}
+                          title={t('btn.resetTokens')}
+                          aria-label={`${t('btn.resetTokens')} ${shortModelName(model.modelId)}`}
+                          className="text-cyber-text-muted/60 hover:text-cyber-accent transition-colors"
+                        >
+                          <X size={9} />
+                        </button>
+                      </div>
+                    ) : null}
+                    {/* Per-node latency probe: [测速] */}
+                    <div className="mt-1 flex items-center gap-1 min-w-0">
+                      <button
+                        type="button"
+                        onClick={() => void pingNode(model)}
+                        disabled={pingingNodeIds.has(model.id)}
+                        aria-label={`${t('btn.ping')} ${shortModelName(model.modelId)}`}
+                        title={t('btn.ping')}
+                        className="flex-shrink-0 text-cyber-text-muted hover:text-cyber-accent transition-colors disabled:opacity-50"
+                      >
+                        <RefreshCw
+                          size={10}
+                          className={pingingNodeIds.has(model.id) ? 'animate-spin' : ''}
+                        />
+                      </button>
+                      {pingingNodeIds.has(model.id) ? (
+                        <span className="text-[10px] text-cyber-text-muted">…</span>
+                      ) : nodeLatencies[model.id] === -1 ? (
+                        <span className="text-[10px] font-bold text-red-500">Error</span>
+                      ) : nodeLatencies[model.id] !== undefined ? (
+                        <span
+                          className={`text-[10px] ${
+                            nodeLatencies[model.id] < 200
+                              ? 'text-green-500'
+                              : nodeLatencies[model.id] < 500
+                                ? 'text-yellow-500'
+                                : 'text-red-500'
+                          }`}
+                        >
+                          {nodeLatencies[model.id]}ms
+                        </span>
+                      ) : (
+                        <span className="text-[10px] text-cyber-text-muted/70">
+                          {t('model.notTested')}
+                        </span>
+                      )}
                     </div>
                   </div>
                 );

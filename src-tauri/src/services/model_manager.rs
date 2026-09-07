@@ -602,8 +602,24 @@ fn build_client(_model: &ModelConfig) -> reqwest::Client {
 }
 
 /// Test model with OpenAI or Anthropic protocol
+/// Models a ping/test can target: everything `get_models()` returns (built-ins,
+/// local server, the synthetic Auto Router entry) plus `smartRouter`-scoped
+/// user models, which `get_models()` deliberately filters out of the Model
+/// Center list but which are still real, routable endpoints (they surface in
+/// the Free Models router view).
+fn lookup_models_for_probe() -> Vec<ModelConfig> {
+    let mut models = get_models();
+    let ids: std::collections::HashSet<String> = models.iter().map(|m| m.internal_id.clone()).collect();
+    for model in get_user_models() {
+        if !ids.contains(&model.internal_id) {
+            models.push(model);
+        }
+    }
+    models
+}
+
 pub async fn test_model(internal_id: &str, prompt: &str, protocol: &str) -> TestResult {
-    let models = get_models();
+    let models = lookup_models_for_probe();
     let model = match models.iter().find(|m| m.internal_id == internal_id) {
         Some(m) => m.clone(),
         None => {
@@ -811,7 +827,7 @@ pub async fn test_model(internal_id: &str, prompt: &str, protocol: &str) -> Test
 
 /// Ping model server (HEAD request, test reachability only)
 pub async fn ping_model(internal_id: &str) -> PingResult {
-    let models = get_models();
+    let models = lookup_models_for_probe();
     let model = match models.iter().find(|m| m.internal_id == internal_id) {
         Some(m) => m.clone(),
         None => {

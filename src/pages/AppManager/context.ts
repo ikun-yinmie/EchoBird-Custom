@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react';
-import type { ModelConfig, LocalTool } from '../../api/types';
+import type { CustomDesktopApp, ModelConfig, LocalTool } from '../../api/types';
 
 // ===== Context =====
 
@@ -59,12 +59,18 @@ export interface AppManagerContextType {
    *  official sentinel) with a bumped nonce the instant a config takes effect,
    *  so that model's card plays the apply-confirmation pulse once. Null at rest. */
   appliedPulse: { id: string; nonce: number } | null;
-  // Launch handler
-  handleLaunch: () => Promise<void>;
+  // Launch handler. `toolId` defaults to the selected tool so the bottom
+  // bar keeps working unchanged; the desktop right-click menu passes its
+  // own id (setSelectedTool is async, so the menu can't rely on it).
+  handleLaunch: (toolId?: string) => Promise<void>;
   // Navigation — internal handler: (toolId, toolName) => fetch install info → call prop
   onGoToMother: (toolId: string, toolName: string) => void;
   // AI-installable tool IDs (from bundled tools/install/index.json)
   aiInstallableIds: string[];
+  /** User-added desktop entries (the "+" tile). Launch-only, no model config. */
+  customTools: CustomDesktopApp[];
+  addCustomTool: (tool: CustomDesktopApp) => void;
+  removeCustomTool: (id: string) => void;
   /** Whether the "未安装" (not installed) section is shown on the desktop */
   showUninstalled: boolean;
   setShowUninstalled: (v: boolean) => void;

@@ -1898,6 +1898,390 @@ pub async fn scan_tools() -> Vec<DetectedTool> {
     results
 }
 
+// ─── Uninstall support ───
+
+/// How a tool can be uninstalled. Sent to the frontend, which maps
+/// `reason_code` to a localized disabled-reason string.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UninstallInfo {
+    pub available: bool,
+    /// "registry" (Windows vendor uninstaller) | "npm" (global npm package).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// Human detail for the confirm dialog: the npm package name, or the
+    /// registry DisplayName on Windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// Machine-readable reason when !available: "unknown_tool" | "builtin" |
+    /// "no_method". The frontend localizes it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason_code: Option<String>,
+}
+
+fn find_definition(tool_id: &str) -> Option<ToolDefinition> {
+    get_definitions().into_iter().find(|d| d.id == tool_id)
+}
+
+/// Describe how `tool_id` can be uninstalled, without doing anything.
+/// Windows prefers the vendor uninstaller recorded in the registry Uninstall
+/// hive (same name/publisher matching as detection); CLI tools fall back to
+/// the owning global npm package. Anything else reports unavailable — the
+/// frontend disables the menu item with the localized reason.
+pub async fn tool_uninstall_info(tool_id: &str) -> UninstallInfo {
+    let not_available = |reason_code: &str| UninstallInfo {
+        available: false,
+        method: None,
+        detail: None,
+        reason_code: Some(reason_code.to_string()),
+    };
+    let Some(def) = find_definition(tool_id) else {
+        return not_available("unknown_tool");
+    };
+    let pc = &def.paths_config;
+    // Bundled tutorial tools (Reversi, Translator, …) ship inside the app —
+    // there is nothing on the machine to uninstall.
+    if pc.always_installed {
+        return not_available("builtin");
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(ref hints) = pc.install_hints {
+        if let Some((display_name, _)) = find_windows_uninstaller(hints) {
+            return UninstallInfo {
+                available: true,
+                method: Some("registry".to_string()),
+                detail: Some(display_name),
+                reason_code: None,
+            };
+        }
+    }
+    if !pc.command.is_empty() {
+        if let Some(pkg) = find_npm_owner_package(&pc.command).await {
+            return UninstallInfo {
+                available: true,
+                method: Some("npm".to_string()),
+                detail: Some(pkg),
+                reason_code: None,
+            };
+        }
+    }
+    not_available("no_method")
+}
+
+/// Run the uninstaller previously described by [`tool_uninstall_info`].
+/// Windows spawns the vendor uninstall wizard detached (it is interactive —
+/// the caller should rescan after it finishes). npm runs
+/// `npm uninstall -g <pkg>` and waits. Returns a human-readable English
+/// detail line; the frontend wraps it in a localized toast.
+pub async fn run_tool_uninstall(tool_id: &str) -> Result<String, String> {
+    let info = tool_uninstall_info(tool_id).await;
+    if !info.available {
+        return Err(info.reason_code.unwrap_or_else(|| "no_method".to_string()));
+    }
+    match info.method.as_deref() {
+        Some("registry") => {
+            let (_, uninst) = find_windows_uninstaller_expect(tool_id)?;
+            spawn_windows_uninstaller(&uninst)?;
+            Ok("Launched the vendor uninstaller — rescan after it finishes.".to_string())
+        }
+        Some("npm") => {
+            let pkg = info.detail.unwrap_or_default();
+            npm_uninstall_global(&pkg).await
+        }
+        _ => Err("no_method".to_string()),
+    }
+}
+
+/// Re-resolve the registry UninstallString for the uninstall run (the info
+/// call only reported availability). Split out so the non-Windows stub keeps
+/// the match arm compiling on every platform.
+fn find_windows_uninstaller_expect(tool_id: &str) -> Result<(String, String), String> {
+    let def = find_definition(tool_id).ok_or_else(|| "unknown_tool".to_string())?;
+    match def
+        .paths_config
+        .install_hints
+        .as_ref()
+        .and_then(find_windows_uninstaller)
+    {
+        Some(pair) => Ok(pair),
+        None => Err("no_method".to_string()),
+    }
+}
+
+/// Spawn a Windows UninstallString detached via `cmd /C`, which handles quoted
+/// exe paths with args (`"E:\App\Uninstall App.exe" /currentuser`) as well as
+/// `msiexec /x {GUID}` forms uniformly. Fire-and-forget: vendor uninstallers
+/// are interactive wizards.
+#[cfg(target_os = "windows")]
+fn spawn_windows_uninstaller(uninstall_string: &str) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    std::process::Command::new("cmd")
+        .args(["/C", uninstall_string])
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("Failed to launch uninstaller: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn spawn_windows_uninstaller(_uninstall_string: &str) -> Result<(), String> {
+    Err("no_method".to_string())
+}
+
+/// Walk the Windows registry Uninstall hives for the entry matching `hints`
+/// (same exact/prefix DisplayName + Publisher rules as detection) and return
+/// its `(DisplayName, UninstallString)`. Returns None when nothing matches or
+/// the matched entry records no usable UninstallString.
+#[cfg(target_os = "windows")]
+fn find_windows_uninstaller(hints: &InstallHints) -> Option<(String, String)> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, KEY_READ};
+    use winreg::RegKey;
+
+    if hints.windows_display_names.is_empty() && hints.windows_display_name_prefixes.is_empty() {
+        return None;
+    }
+    let names_lower: Vec<String> = hints
+        .windows_display_names
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let prefixes_lower: Vec<String> = hints
+        .windows_display_name_prefixes
+        .iter()
+        .map(|s| s.to_lowercase())
+        .collect();
+    let publisher_filter = hints.windows_publisher.as_ref().map(|p| p.to_lowercase());
+
+    let hives: &[(_, &str)] = &[
+        (
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_CURRENT_USER,
+            "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+    ];
+
+    for (hive, path) in hives {
+        let key = RegKey::predef(*hive);
+        let uninstall = match key.open_subkey_with_flags(path, KEY_READ) {
+            Ok(k) => k,
+            Err(_) => continue,
+        };
+        for subkey_name in uninstall.enum_keys().filter_map(|x| x.ok()) {
+            let entry = match uninstall.open_subkey(&subkey_name) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            let display_name: String = entry.get_value("DisplayName").unwrap_or_default();
+            if display_name.is_empty() {
+                continue;
+            }
+            if !registry_display_name_matches(
+                &display_name.to_lowercase(),
+                &names_lower,
+                &prefixes_lower,
+            ) {
+                continue;
+            }
+            if let Some(ref pub_filter) = publisher_filter {
+                let pub_val: String = entry.get_value("Publisher").unwrap_or_default();
+                if !pub_val.to_lowercase().contains(pub_filter) {
+                    continue;
+                }
+            }
+            let uninst: String = entry.get_value("UninstallString").unwrap_or_default();
+            if uninst.trim().is_empty() {
+                continue;
+            }
+            return Some((display_name, uninst));
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+#[allow(dead_code)]
+fn find_windows_uninstaller(_hints: &InstallHints) -> Option<(String, String)> {
+    None
+}
+
+/// Map a CLI command to its owning global npm package. Resolves the command
+/// to a real path (following the symlinks npm creates), requires it to live
+/// under `npm root -g`, then finds the package whose package.json `bin` map
+/// points at it. Returns None for non-npm commands (brew, manual installs…).
+///
+/// Windows note: npm there installs `.cmd` shims (not symlinks) beside
+/// node_modules, so the canonicalized bin never lands under the global root
+/// and this returns None — Windows CLI tools uninstall via their registry
+/// entry instead when one exists.
+async fn find_npm_owner_package(command: &str) -> Option<String> {
+    // Same simple-name gate as shell_command_path: never forward shell
+    // metacharacters into a spawned process.
+    if command.is_empty()
+        || !command
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+    {
+        return None;
+    }
+    let bin_path = platform::get_command_path(command).await?;
+    let canonical = std::fs::canonicalize(&bin_path).ok()?;
+    let root = npm_global_root().await?;
+    find_npm_owner_in_root(&canonical, &root)
+}
+
+/// `npm root -g` with a timeout — npm can hang on broken configs and this
+/// runs on the UI-triggered path (right-click menu), so never block forever.
+async fn npm_global_root() -> Option<PathBuf> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("npm")
+            .args(["root", "-g"])
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if line.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(line))
+}
+
+/// Pure-fs core of [`find_npm_owner_package`]: given an already-canonicalized
+/// bin path and the global root, scan installed packages' `bin` maps for an
+/// entry resolving to it. Handles scoped packages (@scope/name). Sync +
+// Filesystem-only so unit tests can point it at a fake root.
+fn find_npm_owner_in_root(canonical_bin: &Path, root: &Path) -> Option<String> {
+    if canonical_bin.strip_prefix(root).is_err() {
+        return None;
+    }
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.filter_map(|e| e.ok()) {
+        let pkg_dir = entry.path();
+        if !pkg_dir.is_dir() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+        // Scoped namespace dir (@scope) — descend one level, the package
+        // name is <scope>/<pkg>.
+        let pkg_dirs: Vec<(String, PathBuf)> = if name_str.starts_with('@') {
+            match std::fs::read_dir(&pkg_dir) {
+                Ok(inner) => inner
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().is_dir())
+                    .map(|e| {
+                        (
+                            format!("{}/{}", name_str, e.file_name().to_string_lossy()),
+                            e.path(),
+                        )
+                    })
+                    .collect(),
+                Err(_) => continue,
+            }
+        } else {
+            vec![(name_str.to_string(), pkg_dir)]
+        };
+        for (pkg_name, dir) in pkg_dirs {
+            if npm_package_owns_bin(&dir, canonical_bin) {
+                return Some(pkg_name);
+            }
+        }
+    }
+    None
+}
+
+/// True when `pkg_dir/package.json` declares a `bin` entry resolving to
+/// `canonical_bin`. Accepts both bin forms npm supports: a string (single bin
+/// named after the package) and a name→path map.
+fn npm_package_owns_bin(pkg_dir: &Path, canonical_bin: &Path) -> bool {
+    let manifest = match std::fs::read_to_string(pkg_dir.join("package.json")) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let v: serde_json::Value = match serde_json::from_str(&manifest) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    let bins: Vec<String> = match v.get("bin") {
+        Some(serde_json::Value::String(s)) => vec![s.clone()],
+        Some(serde_json::Value::Object(map)) => map
+            .values()
+            .filter_map(|b| b.as_str().map(str::to_string))
+            .collect(),
+        _ => return false,
+    };
+    bins.iter().any(|rel| {
+        let target = pkg_dir.join(rel);
+        // Canonicalize when possible (bin targets are usually symlinks or
+        // plain files); fall back to a lexical compare so odd layouts still
+        // get a chance instead of silently missing.
+        match std::fs::canonicalize(&target) {
+            Ok(c) => c == canonical_bin,
+            Err(_) => target == canonical_bin,
+        }
+    })
+}
+
+/// `npm uninstall -g <pkg>` with a generous timeout. Waits for completion so
+/// the frontend can rescan right after.
+async fn npm_uninstall_global(pkg: &str) -> Result<String, String> {
+    if pkg.is_empty()
+        || !pkg.chars().all(|c| {
+            c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/' || c == '@'
+        })
+    {
+        return Err("Refusing to uninstall an unexpected package name.".to_string());
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(180),
+        tokio::process::Command::new("npm")
+            .args(["uninstall", "-g", pkg])
+            .output(),
+    )
+    .await
+    .map_err(|_| "npm uninstall timed out after 3 minutes.".to_string())?
+    .map_err(|e| format!("Failed to run npm uninstall: {e}"))?;
+    if output.status.success() {
+        Ok(format!("npm uninstalled {pkg}."))
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let tail: String = stderr
+            .lines()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        Err(if tail.trim().is_empty() {
+            format!("npm uninstall {pkg} failed with no output.")
+        } else {
+            format!("npm uninstall {pkg} failed: {tail}")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -2293,5 +2677,89 @@ mod tests {
         assert!(!is_windows_exe("C:\\Program Files\\ZCode\\resources.dll"));
         // No extension at all.
         assert!(!is_windows_exe("C:\\Program Files\\ZCode\\zcode"));
+    }
+
+    // ── npm uninstall owner resolution: find_npm_owner_in_root against a
+    //    fake global root (real npm layout: <root>/<pkg>/package.json +
+    //    <root>/<pkg>/bin/cli.js). ──
+
+    fn fake_npm_root(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "echobird_npm_{}_{}_{}",
+            tag,
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        root
+    }
+
+    fn write_pkg(root: &std::path::Path, name: &str, bin_json: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/cli.js"), b"#!/usr/bin/env node\n").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            format!("{{\"name\":\"{name}\",\"bin\":{bin_json}}}"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn npm_owner_found_via_bin_map() {
+        let root = fake_npm_root("map");
+        write_pkg(&root, "some-cli", r#"{"some":"./bin/cli.js"}"#);
+        write_pkg(&root, "other-pkg", r#"{"other":"./bin/cli.js"}"#);
+
+        let bin = std::fs::canonicalize(root.join("some-cli/bin/cli.js")).unwrap();
+        assert_eq!(
+            super::find_npm_owner_in_root(&bin, &root).as_deref(),
+            Some("some-cli")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn npm_owner_found_via_string_bin_and_scope() {
+        // String-form bin + scoped package (@scope/name lives one level deeper).
+        let root = fake_npm_root("scoped");
+        let dir = root.join("@acme/tool");
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(dir.join("bin/cli.js"), b"").unwrap();
+        std::fs::write(
+            dir.join("package.json"),
+            r#"{"name":"@acme/tool","bin":"./bin/cli.js"}"#,
+        )
+        .unwrap();
+
+        let bin = std::fs::canonicalize(dir.join("bin/cli.js")).unwrap();
+        assert_eq!(
+            super::find_npm_owner_in_root(&bin, &root).as_deref(),
+            Some("@acme/tool")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn npm_owner_rejects_outside_bin_and_missing_manifest() {
+        let root = fake_npm_root("neg");
+        write_pkg(&root, "some-cli", r#"{"some":"./bin/cli.js"}"#);
+        // Package dir without package.json — must be skipped, not crash.
+        std::fs::create_dir_all(root.join("broken/bin")).unwrap();
+        std::fs::write(root.join("broken/bin/cli.js"), b"").unwrap();
+
+        // A path outside the root is never owned…
+        let outside = std::env::temp_dir().join("echobird_npm_outside.js");
+        std::fs::write(&outside, b"").unwrap();
+        let outside = std::fs::canonicalize(&outside).unwrap();
+        assert!(super::find_npm_owner_in_root(&outside, &root).is_none());
+        // …nor is an unknown file inside the root.
+        let stray = std::fs::canonicalize(root.join("broken/bin/cli.js")).unwrap();
+        assert!(super::find_npm_owner_in_root(&stray, &root).is_none());
+
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -139,3 +139,84 @@ pub fn get_volc_aksk(internal_id: String) -> Option<VolcAksk> {
         secret_key: sk,
     })
 }
+
+/// Fetch the model-id list advertised by an OpenAI-compatible `/models`
+/// endpoint. Used by the Add-Model modal's 获取模型 button when a user adds
+/// a custom API by hand: the URL + key typed into the form are sent verbatim
+/// (an `enc:v1:` key is decrypted first), and the returned ids feed the
+/// model-id combobox so it can offer fuzzy search while still allowing free
+/// typing.
+#[tauri::command]
+pub async fn list_remote_models(
+    base_url: String,
+    api_key: String,
+) -> Result<Vec<String>, String> {
+    let base = base_url.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err("OpenAI base URL is empty".to_string());
+    }
+
+    // Accept a base without trailing path, a /v1 base, or even a pasted
+    // full /chat/completions URL — all normalize to <base>/models.
+    let stripped = base
+        .strip_suffix("/chat/completions")
+        .or_else(|| base.strip_suffix("/responses"))
+        .unwrap_or(base)
+        .trim_end_matches('/');
+    let url = format!("{}/models", stripped);
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("HTTP client init failed: {e}"))?;
+
+    let usable_key = model_manager::decrypt_key_for_use(&api_key);
+    let resp = client
+        .get(&url)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {usable_key}"))
+        .send()
+        .await
+        .map_err(|e| format!("Request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        let status = resp.status().as_u16();
+        let text = resp.text().await.unwrap_or_default();
+        let excerpt: String = text.chars().take(300).collect();
+        return Err(format!("HTTP {status}: {excerpt}"));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Response is not JSON: {e}"))?;
+
+    // Accept the standard OpenAI shape `{"data":[{"id":...}]}`, plus lax
+    // variants some relays use: a top-level "models" array or a bare array
+    // of strings.
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(arr) = json["data"].as_array() {
+        for item in arr {
+            if let Some(id) = item["id"].as_str() {
+                ids.push(id.to_string());
+            }
+        }
+    } else if let Some(arr) = json["models"].as_array() {
+        for item in arr {
+            if let Some(id) = item["id"].as_str() {
+                ids.push(id.to_string());
+            } else if let Some(s) = item.as_str() {
+                ids.push(s.to_string());
+            }
+        }
+    } else if let Some(arr) = json.as_array() {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                ids.push(s.to_string());
+            }
+        }
+    }
+
+    ids.sort();
+    ids.dedup();
+    Ok(ids)
+}

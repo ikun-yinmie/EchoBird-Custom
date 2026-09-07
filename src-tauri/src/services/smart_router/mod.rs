@@ -136,6 +136,18 @@ pub fn get_public_config() -> Result<PublicConfig, String> {
     load_config().map(public_config)
 }
 
+pub use server::TokenStat;
+
+/// Approximate per-candidate token usage tallied by the router proxy.
+pub fn token_stats() -> Vec<TokenStat> {
+    server::token_stats()
+}
+
+/// Zero the router's token counters — all candidates (None) or one.
+pub fn reset_token_stats(internal_id: Option<String>) {
+    server::reset_token_stats(internal_id.as_deref());
+}
+
 pub fn get_public_activity() -> PublicActivity {
     server::public_activity()
 }

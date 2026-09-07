@@ -1,6 +1,6 @@
 // ModelCard component
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { RefreshCw } from 'lucide-react';
 import { useConfirm } from '../ConfirmDialog';
 import { useI18n } from '../../hooks/useI18n';
@@ -136,6 +136,10 @@ export interface ModelCardProps {
   usageData?: ModelUsageData; // usage quota data
   onEdit?: () => void; // edit callback
   onDelete?: () => void; // delete callback
+  /** Per-card latency test (same backend as ping-all). */
+  onPing?: () => void;
+  /** Copy connection info (endpoint + model id + key) to the clipboard. */
+  onCopy?: () => void;
   onRefresh?: () => void; // refresh usage callback (usage mode only)
   isRefreshingUsage?: boolean; // usage refresh in progress (usage mode only)
   onAccessKey?: () => void; // open AK/SK config modal (Volcengine usage mode)
@@ -262,6 +266,8 @@ export const ModelCard = React.memo(
     usageData,
     onEdit,
     onDelete,
+    onPing,
+    onCopy,
     onRefresh,
     isRefreshingUsage = false,
     onAccessKey,
@@ -285,13 +291,51 @@ export const ModelCard = React.memo(
       return () => clearInterval(timer);
     }, [viewMode, usageData]);
 
+    // [复制] → [✓] transient feedback (kept local; the copy itself is async
+    // and owned by the parent).
+    const [justCopied, setJustCopied] = useState(false);
+    const copiedResetRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    useEffect(
+      () => () => {
+        if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+      },
+      []
+    );
+
     return (
       <div className="h-48 p-4 border border-transparent bg-cyber-surface hover:bg-cyber-elevated relative overflow-hidden rounded-card cursor-default transition-colors flex flex-col">
         {/* Action buttons — top right, different for config vs usage mode */}
         {viewMode === 'config' ? (
-          // Config mode: [删除] [编辑]
-          (onEdit || onDelete) && (
+          // Config mode: [测速] [复制] [删除] [编辑]
+          (onEdit || onDelete || onPing || onCopy) && (
             <div className="absolute top-2 right-2 flex gap-0.5">
+              {onPing && (
+                <button
+                  className="text-xs font-mono text-cyber-text-muted/70 hover:text-cyber-accent transition-colors"
+                  disabled={isPinging}
+                  aria-label={t('btn.ping')}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onPing();
+                  }}
+                >
+                  [{t('btn.ping')}]
+                </button>
+              )}
+              {onCopy && (
+                <button
+                  className="text-xs font-mono text-cyber-text-muted/70 hover:text-cyber-text transition-colors"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onCopy();
+                    setJustCopied(true);
+                    if (copiedResetRef.current) clearTimeout(copiedResetRef.current);
+                    copiedResetRef.current = setTimeout(() => setJustCopied(false), 1600);
+                  }}
+                >
+                  {justCopied ? t('btn.copied') : t('btn.copy')}
+                </button>
+              )}
               {onDelete && (
                 <button
                   className="text-xs font-mono text-cyber-text-muted/70 hover:text-red-500 transition-colors"

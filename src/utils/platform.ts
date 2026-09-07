@@ -11,6 +11,18 @@ export const IS_LINUX: boolean = (() => {
   }
 })();
 
+// Synchronous Windows check — the "add app" file picker only offers
+// executables there (.exe/.lnk/.bat); elsewhere any file is pickable.
+export const IS_WINDOWS: boolean = (() => {
+  try {
+    const ua = (navigator as unknown as { userAgentData?: { platform?: string } }).userAgentData;
+    const platform = (ua?.platform || navigator.platform || '').toLowerCase();
+    return platform.includes('win');
+  } catch {
+    return false;
+  }
+})();
+
 // Synchronous macOS check — the frameless title bar must decide on the first
 // paint whether window controls sit on the left (native traffic lights, macOS)
 // or the right (Windows/Linux), and CSS must know whether to drop the custom
